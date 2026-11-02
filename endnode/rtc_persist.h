@@ -30,7 +30,11 @@ struct RtcPersist {
     uint8_t is_first_run;
     uint8_t err_count;
     uint8_t err_head;
-    uint8_t pad;
+    uint8_t last_transport;
+    uint8_t wakes_since_cell;
+    uint8_t pad0;
+    uint8_t pad1;
+    uint8_t pad2;
     char err_ring[RTC_ERR_SLOTS][RTC_ERR_BYTES];
     char pool[RTC_POOL_BYTES];
 };

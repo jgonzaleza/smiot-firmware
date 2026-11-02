@@ -14,3 +14,4 @@
 *.key
 endnode/certs/AWSClientPrivateKey.h
 endnode/certs/AWSClientCertificate.h
+endnode/secrets.h
