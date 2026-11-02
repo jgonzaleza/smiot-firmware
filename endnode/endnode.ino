@@ -38,6 +38,8 @@
 #include "queue_manager.h"
 #include "csv_parse.h"
 #include "param_limits.h"
+#include "power_policy.h"
+#include "variant.h"
 
 // External Libraries
 #include <ModbusMaster.h>
@@ -180,6 +182,16 @@ CellularCommunicationClient cell_client;
 WifiCommunicationClient wifi_client;
 #endif
 CommunicationManager comm;
+bool modem_was_powered = false;
+uint32_t active_sleep_sec = DEFAULT_SLEEP_SEC;
+uint8_t active_power_mode = POWER_NORMAL;
+bool announce_power_mode = false;
+int max_backlog_batches = 2;
+String configured_apn = "";
+RTC_DATA_ATTR uint8_t radio_skip_remaining = 0;
+RTC_DATA_ATTR uint8_t gps_fail_streak = 0;
+RTC_DATA_ATTR int saved_power_mode = POWER_NORMAL;
+float last_pack_volts = -1;
 
 // Global Flags
 bool reset_rain_sensor = false; //Flag to reset rain sensor
@@ -807,73 +819,66 @@ void go_sleep(){
         local_logger(e.what());
     }
 
+    if (!modem_was_powered) {
+        local_logger("Modem was not powered. Skipping CPOF.");
+    } else {
     #ifdef DEBUG
         Serial.println("Enter modem power off!");
     #endif
-    int i = 60;
-    while (!modem.poweroff() && i > 0) {
-        #ifdef DEBUG
-            Serial.print("Modem entering power off: ");
-            Serial.println(i);
-            Serial.println();
-        #endif
-        i--;
-        delay(500);
-    } 
-
-    #ifdef DEBUG
-        Serial.println("Waiting for modem power off");
-    #endif
+    feed_watchdog();
+    modem.poweroff();
     delay(5000);
-    int k = 50;
-    while (modem.testAT() && (k > 0)) {
-        delay(1000);
+    feed_watchdog();
+    int k = 10;
+    while (modem.testAT(500) && (k > 0)) {
+        delay(500);
         k--;
+        feed_watchdog();
     }
-    #ifdef DEBUG
-        Serial.println("Modem is not responding ,modem has power off !");        
-    #endif
+    }
 
-    //Try to low the current when deep sleep
     pinMode(PIN_5V_EN, OUTPUT);
     digitalWrite(PIN_5V_EN, LOW);
+    gpio_hold_en((gpio_num_t)PIN_5V_EN);
+    if (rtc_gpio_is_valid_gpio((gpio_num_t)PIN_5V_EN)) {
+        rtc_gpio_hold_en((gpio_num_t)PIN_5V_EN);
+    }
+
     pinMode(RS485_EN_PIN, OUTPUT);
     digitalWrite(RS485_EN_PIN, LOW);
-    
-    if (rtc_gpio_isolate((gpio_num_t)PIN_5V_EN) == ESP_OK) {
-        local_logger("PIN_5V_EN INSOLATED");
-    }
-    
- 
-    // Pull up DTR to put the modem into sleep
+    gpio_hold_en((gpio_num_t)RS485_EN_PIN);
+
+    pinMode(RESET_RAIN_SENSOR_PIN, OUTPUT);
+    digitalWrite(RESET_RAIN_SENSOR_PIN, LOW);
+    gpio_hold_en((gpio_num_t)RESET_RAIN_SENSOR_PIN);
+
+    pinMode(BOARD_SD_CS_PIN, OUTPUT);
+    digitalWrite(BOARD_SD_CS_PIN, HIGH);
+    gpio_hold_en((gpio_num_t)BOARD_SD_CS_PIN);
+
+    ledcDetachPin(LED_RED_PIN);
+    ledcDetachPin(LED_GREEN_PIN);
+    ledcDetachPin(LED_BLUE_PIN);
+
     pinMode(MODEM_DTR_PIN, OUTPUT);
     digitalWrite(MODEM_DTR_PIN, LOW);
 
-    #ifdef BOARD_POWERON_PIN
-        // Turn off DC boost to power off the modem
-        digitalWrite(BOARD_POWERON_PIN, LOW);
-        //rtc_gpio_isolate((gpio_num_t)BOARD_POWERON_PIN);
-    #endif
-
     #ifdef MODEM_RESET_PIN
-        // Keep it low during the sleep period. If the module uses GPIO5 as reset, 
-        // there will be a pulse when waking up from sleep that will cause the module to start directly.
         digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
         gpio_hold_en((gpio_num_t)MODEM_RESET_PIN);
-        gpio_deep_sleep_hold_en();
     #endif
+    gpio_deep_sleep_hold_en();
 
     #ifdef DEBUG
         Serial.println("Weather Station is going to  deep sleep!");
     #endif
 
-    
     uint32_t awake_sec = (millis() - g_wake_start_ms) / 1000UL;
-    uint32_t sleep_sec = TIME_TO_SLEEP_SEC;
+    uint32_t sleep_sec = active_sleep_sec;
     if (awake_sec + 1 < sleep_sec) sleep_sec = sleep_sec - awake_sec;
     else sleep_sec = 1;
     esp_sleep_enable_timer_wakeup((uint64_t)sleep_sec * uS_TO_S_FACTOR);
-    delay(200);    
+    delay(200);
 
     esp_deep_sleep_start();
     Serial.println("#### This will never be printed ####");
@@ -892,23 +897,14 @@ void init_modem() {
         #endif
     }
 
-    // Turn on DC boost to power on the modem
-    #ifdef BOARD_POWERON_PIN
-        pinMode(BOARD_POWERON_PIN, OUTPUT);
-        digitalWrite(BOARD_POWERON_PIN, HIGH);
-    #endif
-
     gpio_hold_dis((gpio_num_t)PIN_5V_EN);
+    gpio_hold_dis((gpio_num_t)RS485_EN_PIN);
+    gpio_hold_dis((gpio_num_t)RESET_RAIN_SENSOR_PIN);
+    gpio_hold_dis((gpio_num_t)BOARD_SD_CS_PIN);
+    gpio_deep_sleep_hold_dis();
 
     #ifdef MODEM_RESET_PIN
-        // Release reset GPIO hold
         gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
-
-        // Set modem reset pin ,reset modem
-        // The module will also be started during reset.
-        #ifdef DEBUG
-            Serial.println("Set Reset Pin.");
-        #endif
         pinMode(MODEM_RESET_PIN, OUTPUT);
         digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL); delay(100);
         digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL); delay(2600);
@@ -916,16 +912,12 @@ void init_modem() {
     #endif
 
     pinMode(MODEM_DTR_PIN, OUTPUT);
-    digitalWrite(MODEM_DTR_PIN, HIGH);
-    #ifdef DEBUG
-        Serial.println("Power on the modem PWRKEY.");
-    #endif
+    digitalWrite(MODEM_DTR_PIN, LOW);
     pinMode(BOARD_PWRKEY_PIN, OUTPUT);
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
     delay(100);
     digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-    //Ton >= 100 <= 500
-    delay(100);
+    delay(1000);
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
 
     // Delay sometime ...
@@ -946,6 +938,7 @@ void init_modem() {
             retry = 0;
         }
     }
+    modem_was_powered = true;
 
     //Put the Led Pin as Output
     pinMode(LED_RED_PIN, OUTPUT);
@@ -1899,6 +1892,13 @@ String get_final_payload(String sensors_payload, String gps_payload, bool result
     doc["net"] = global_apn;
     doc["ts"] = (int)current_time_source;
     doc["tm"] = final_timestamp;
+    doc["eff_sleep"] = active_sleep_sec;
+    doc["power_mode"] = active_power_mode;
+    doc["next_msg_at"] = (long)final_timestamp + (long)active_sleep_sec;
+    if (announce_power_mode) {
+        doc["evt"] = "MODE_CHANGE";
+        doc["pack_v"] = last_pack_volts;
+    }
 
     if (!is_sdcard_ok) {
         doc["sd_st"] = false;
@@ -1973,17 +1973,10 @@ String get_gps_position(bool show_status=false) {
         local_logger("GPS Enabling Failed!");
     } else {
         local_logger("GPS Enabled");
-        // Set GPS Baud to 115200
-        modem.setGPSBaud(115200);        
-        //The first time we need half minute at least to get a position.
-        for (int j=0;j<30;j++) {
-            if (show_status) {
-                blink_led(0,0,255);
-            } else {
-                delay(1000);
-            }            
-        }
-        i = 60;
+        modem.setGPSBaud(115200);
+        int attempts = 15;
+        if (gps_fail_streak >= 3) attempts = 5;
+        i = attempts;
         while (i > 0) {
             local_logger("Requesting current GPS/GNSS/GLONASS location");
             got_gps_data = modem.getGPS(&fixMode, &lat2, &lon2, &speed2, &alt2, &vsat2, &usat2, &accuracy2,
@@ -2014,6 +2007,7 @@ String get_gps_position(bool show_status=false) {
     Serial.println("DISABLE GPS . . .");
     modem.disableGPS();
     if (gps_fix_ok(lat2, lon2)){
+        gps_fail_streak = 0;
         //Si los datos están en los rangos normales para Costa Rica ya no los buscamos más.            
         #ifdef DEBUG
             local_logger("GET a Long and Lat. . .");
@@ -2104,9 +2098,10 @@ bool send_all_queued_data() {
     
     set_mqtt_subscription();
     bool all_batches_ok = true;
+    int batches_sent = 0;
 
     // Bucle de paginación: mientras existan registros en RTC o SD...
-    while (has_pending_data()) {
+    while (has_pending_data() && batches_sent < max_backlog_batches) {
         feed_watchdog(); // Alimentamos el WDT en cada lote por seguridad
 
         // Extrae un arreglo JSON de hasta MAX_BATCH_SIZE lecturas: "[{...},{...}]"
@@ -2116,7 +2111,8 @@ bool send_all_queued_data() {
         local_logger("Enviando lote paginado por MQTT...");
         if (publish_sensor_payload(batch_payload)) {
             // Éxito: Se eliminan definitivamente estos registros de la fuente (RTC o SD)
-            commit_batch(); 
+            commit_batch();
+            batches_sent++; 
             local_logger("Lote enviado y confirmado con éxito.");
             
             // Un breve respiro para procesar respuestas del broker si es necesario
@@ -2162,6 +2158,34 @@ bool use_wifi_client() {
 }
 #endif
 
+bool connect_uplink(bool show_status);
+
+void apply_pack_power(const String& payload) {
+    float volts = -1;
+    const char* keys[] = {"\"pack_v\":", "\"voltage\":", "\"vbat\":", "\"V\":"};
+    for (int i = 0; i < 4 && volts < 0; i++) {
+        int at = payload.indexOf(keys[i]);
+        if (at < 0) continue;
+        volts = payload.substring(at + strlen(keys[i])).toFloat();
+    }
+    PowerInput in = {};
+    in.pack_volts = volts;
+    in.pack_valid = volts > 5.0f && volts < 20.0f;
+    in.previous = (PowerMode)saved_power_mode;
+    in.backend_sleep_sec = TIME_TO_SLEEP_SEC;
+    in.backend_reading_count = READING_COUNT;
+    PowerDecision decision = decide_power(in);
+    active_power_mode = (uint8_t)decision.mode;
+    active_sleep_sec = decision.eff_sleep_sec;
+    announce_power_mode = decision.changed;
+    saved_power_mode = decision.mode;
+    last_pack_volts = in.pack_valid ? volts : -1;
+    if (!in.pack_valid) {
+        local_logger("Pack voltage missing or failed. Keeping the backend interval.");
+        add_sensor_error("[PACK_V_MISSING]");
+    }
+}
+
 bool connect_uplink(bool show_status) {
 #ifdef FEATURE_WIFI
     bool prefer_wifi = (g_rtc.last_transport == 1 && g_rtc.wakes_since_cell < CELL_RETRY_EVERY);
@@ -2201,12 +2225,16 @@ void setup() {
         load_device_params();
     }
 
-    init_modem();
-
+    Serial.begin(115200);
     Serial.println(ESP.getEfuseMac());
+    gpio_hold_dis((gpio_num_t)PIN_5V_EN);
+    gpio_deep_sleep_hold_dis();
+    pinMode(PIN_5V_EN, OUTPUT);
+    digitalWrite(PIN_5V_EN, HIGH);
  
     if (rtc_reset_was_panic()) {
         local_logger("Panic or watchdog reset. Forcing OTA rescue.");
+        init_modem();
         if (connect_uplink(false)) {
             check_for_firmware_update(true);
         }
@@ -2228,8 +2256,9 @@ void setup() {
     init_relay();
     feed_watchdog();
 
-    if (first_run || readingCnt >= (int)READING_COUNT) {
+    if (first_run) {
         feed_watchdog();
+        if (!modem_was_powered) init_modem();
         result = connect_uplink(first_run);
         
         if (result) {
@@ -2265,10 +2294,6 @@ void setup() {
     turn_sensors_on();
     start_time = millis();
 
-    // Get GPS Payload (Utilizará el caché RTC automáticamente si el módem está apagado)
-    String gps_payload = get_gps_payload(first_run);
-    feed_watchdog();
-
     // Start Async Sensors and Wait for them to be ready if we have any configured, 
     //if not it will do nothing and we will read them immediately in the next step
     prepare_async_sensors();
@@ -2281,9 +2306,38 @@ void setup() {
     // FASE 2: Recolección inmediata de todos los sensores listos
     String final_sensor_payload = get_final_sensor_payload();
     feed_watchdog();
+    apply_pack_power(final_sensor_payload);
 
     // Shutdown sensors
     turn_sensors_off();
+
+    String gps_payload = "{\"src\":\"Skipped\"}";
+    if (modem_was_powered) {
+        gps_payload = get_gps_payload(first_run);
+        feed_watchdog();
+    } else if (gps_fix_ok(local_lat2, local_lon2)) {
+        gps_payload = "{\"lat\":" + String(local_lat2, 5) + ",\"lon\":" + String(local_lon2, 5) + ",\"src\":\"Cache\"}";
+    }
+
+    bool allow_radio = active_power_mode != POWER_CRITICAL || announce_power_mode;
+    if (radio_skip_remaining > 0 && !announce_power_mode && !first_run) {
+        radio_skip_remaining--;
+        allow_radio = false;
+    }
+    if (!result && allow_radio && readingCnt >= (int)READING_COUNT) {
+        init_modem();
+        result = connect_uplink(false);
+        if (result) {
+#ifdef FEATURE_WIFI
+            if (comm.isWifi()) reliable_time_sync_wifi();
+            else reliable_time_sync(modem);
+#else
+            reliable_time_sync(modem);
+#endif
+            check_for_firmware_update(false);
+            gps_payload = get_gps_payload(false);
+        }
+    }
 
     // Do SD Card Diagnosis and Repair if needed
     if (!is_sdcard_ok) {
@@ -2333,6 +2387,7 @@ void setup() {
             // Increase the consecutive upload failures counter and check if we need to trigger a hardware reset to recover from potential network issues
             consecutive_upload_failures++;
             consecutive_network_changes++;
+            if (consecutive_upload_failures >= 3) radio_skip_remaining = 3;
             if (consecutive_upload_failures >= MAX_CONSECUTIVE_FAILURES) {
                 local_logger("Demasiados fallos de envio consecutivos. Forzando reinicio de hardware!");
                 consecutive_upload_failures = 0;
