@@ -17,15 +17,32 @@
 
 #include "TinyGsmClientSIM70xx.h"
 #include "TinyGsmTCP.tpp"
-#include "TinyGsmSSL.tpp"
 
-class TinyGsmSim7000SSL
-    : public TinyGsmSim70xx<TinyGsmSim7000SSL>,
-      public TinyGsmTCP<TinyGsmSim7000SSL, TINY_GSM_MUX_COUNT>,
-      public TinyGsmSSL<TinyGsmSim7000SSL> {
-  friend class TinyGsmSim70xx<TinyGsmSim7000SSL>;
+enum NMEA_Sentences {
+    NMEA_GPGGA   = _BV(0),    // Bit 0: GPGGA (global positioning system fix data)
+    NMEA_GPRMC   = _BV(1),    // Bit 1: GPRMC (recommended minimum specific GPS/TRANSIT data)
+    NMEA_GPGSV   = _BV(2),    // Bit 2: GPGSV (GPS satellites in view)
+    NMEA_GPGSA   = _BV(3),    // Bit 3: GPGSA (GPS DOP and active satellites)
+    NMEA_GPVTG   = _BV(4),    // Bit 4: GPVTG (track made good and ground speed)
+    NMEA_PQXFI   = _BV(5),    // Bit 5: PQXFI (Global Positioning System Extended Fix Data)
+    NMEA_GLGSV   = _BV(6),    // Bit 6: GLGSV (GLONASS satellites in view GLONASS fixes only)
+    NMEA_GNGSA   = _BV(7),    // Bit 7: GNGSA (1. GPS/2. Glonass/3. GALILE DOP and Active Satellites)
+    NMEA_GNGNS   = _BV(8),    // Bit 8: GNGNS (fix data for GNSS receivers;output for GPS,GLONASS,GALILEO)
+    // Bit 9: reserve
+    NMEA_GAGSV   = _BV(10),   // Bit 10: GAGSV (GALILEO satellites in view)
+    // Bit 11: reserve
+    // Bit 12: reserve
+    // Bit 13: reserve
+    // Bit 14: reserve
+    // Bit 15: reserve
+    NMEA_BDGSA_PQGSA = _BV(16),  // Bit 16: BDGSA/PQGSA (BEIDOU/QZSS DOP and active satellites)
+    NMEA_BDGSV_PQGSV = _BV(17)   // Bit 17: BDGSV/PQGSV (BEIDOUQZSS satellites in view)
+};
+
+class TinyGsmSim7000SSL : public TinyGsmSim70xx<TinyGsmSim7000SSL,QUALCOMM_SIM7000G>,
+                          public TinyGsmTCP<TinyGsmSim7000SSL, TINY_GSM_MUX_COUNT> {
+  friend class TinyGsmSim70xx<TinyGsmSim7000SSL,QUALCOMM_SIM7000G>;
   friend class TinyGsmTCP<TinyGsmSim7000SSL, TINY_GSM_MUX_COUNT>;
-  friend class TinyGsmSSL<TinyGsmSim7000SSL>;
 
   /*
    * Inner Client
@@ -118,7 +135,7 @@ class TinyGsmSim7000SSL
    */
  public:
   explicit TinyGsmSim7000SSL(Stream& stream)
-      : TinyGsmSim70xx<TinyGsmSim7000SSL>(stream),
+      : TinyGsmSim70xx<TinyGsmSim7000SSL,QUALCOMM_SIM7000G>(stream),
         certificates() {
     memset(sockets, 0, sizeof(sockets));
   }
@@ -217,7 +234,7 @@ class TinyGsmSim7000SSL
  protected:
   bool gprsConnectImpl(const char* apn, const char* user = NULL,
                        const char* pwd = NULL) {
-    gprsDisconnect();
+      gprsDisconnect();
 
     // Define the PDP context
     sendAT(GF("+CGDCONT=1,\"IP\",\""), apn, '"');
@@ -283,6 +300,28 @@ class TinyGsmSim7000SSL
     sendAT(GF("+CGATT=0"));  // Deactivate the bearer context
     if (waitResponse(60000L) != 1) { return false; }
 
+    return true;
+  }
+
+  bool setNetworkDeactivateImpl() {
+    if (!getNetworkActiveImpl()) { return true; }
+    sendAT(GF("+CNACT=0"));
+    if (waitResponse(10000L) != 1) { return false; }
+    if (waitResponse(60000L, "+APP PDP: DEACTIVE") != 1) { return false; }
+    return true;
+  }
+
+  bool setNetworkActiveImpl() {
+    if (getNetworkActiveImpl()) { return true; }
+    sendAT(GF("+CNACT=1"));
+    if (waitResponse(10000L) != 1) { return false; }
+    return waitResponse(60000L, "+APP PDP: ACTIVE", "+APP PDP: DEACTIVE") == 1;
+  }
+
+  bool getNetworkActiveImpl() {
+    sendAT(GF("+CNACT?"));
+    if (waitResponse(GF(GSM_NL "+CNACT: 1")) != 1) { return false; }
+    waitResponse();
     return true;
   }
 
@@ -372,7 +411,7 @@ class TinyGsmSim7000SSL
         // <cid> Application connection ID (set with AT+CACID above)
         // <certname> certificate name
         sendAT(GF("+CASSLCFG="), mux, ",CACERT,\"", certificates[mux].c_str(),
-               "\"");
+               "\"");        
         if (waitResponse(5000L) != 1) return false;
       }
 
@@ -428,12 +467,24 @@ class TinyGsmSim7000SSL
     stream.write(reinterpret_cast<const uint8_t*>(buff), len);
     stream.flush();
 
+    // FIXME LilyGO SIM7000G returns only a simple okay
+    // *
+    // Revision:1529B10SIM7000G
+    // CSUB:V02
+    // APRev:1529B10SIM7000,V02
+    // QCN:MDM9206_TX3.0.SIM7000G_P1.03C_20240911
+    // *
+    // OK after posting data
+    if (waitResponse() != 1) { return 0; }
+
+    return len;
+
     // after posting data, module responds with:
     //+CASEND: <cid>,<result>,<sendlen>
-    if (waitResponse(GF(GSM_NL "+CASEND:")) != 1) { return 0; }
-    streamSkipUntil(',');                            // Skip mux
-    if (streamGetIntBefore(',') != 0) { return 0; }  // If result != success
-    return streamGetIntBefore('\n');
+    // if (waitResponse(GF(GSM_NL "+CASEND:")) != 1) { return 0; }
+    // streamSkipUntil(',');                            // Skip mux
+    // if (streamGetIntBefore(',') != 0) { return 0; }  // If result != success
+    // return streamGetIntBefore('\n');
   }
 
   size_t modemRead(size_t size, uint8_t mux) {

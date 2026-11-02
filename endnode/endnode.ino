@@ -1168,7 +1168,7 @@ bool init_network(NetworkMode mode_setup_value, bool show_status=false) {
                     delay(1000);
                 } 
                 break;
-            case REG_EMERGENCY:
+            case REG_EMERGENCY_ONLY:
                 local_logger("Attached for emergency bearer services only");
                 if (show_status) {
                     blink_led(0, 255, 0);
@@ -1212,7 +1212,7 @@ bool init_network(NetworkMode mode_setup_value, bool show_status=false) {
     //For Roaming Enabling the network din't work. We use wait for network
     bool enable_network = false;
     String ipAddress = "";
-    if (status != REG_OK_ROAMING && status != REG_EMERGENCY) {
+    if (status != REG_OK_ROAMING && status != REG_EMERGENCY_ONLY) {
         k = 60;
         enable_network = modem.enableNetwork();
         while (!enable_network && k > 0) {

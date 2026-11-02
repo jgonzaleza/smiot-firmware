@@ -20,11 +20,18 @@
 #include "TinyGsmTime.tpp"
 #include "TinyGsmNTP.tpp"
 #include "TinyGsmGSMLocation.tpp"
+#include "TinyGsmGPS_EX.tpp"
+#include "TinyGsmHttpsSIM7xxx.h"
+#include "TinyGsmMqttSIM7xxx.h"
+#include "TinyGsmSSL.tpp"
+
+#define TINY_GSM_MODEM_HAS_NETWORK_MODE
+#define TINY_GSM_MODEM_HAS_PREFERRED_MODE
 
 #define GSM_NL "\r\n"
 static const char GSM_OK[] TINY_GSM_PROGMEM    = "OK" GSM_NL;
 static const char GSM_ERROR[] TINY_GSM_PROGMEM = "ERROR" GSM_NL;
-#if defined       TINY_GSM_DEBUG
+#if defined TINY_GSM_DEBUG
 static const char GSM_CME_ERROR[] TINY_GSM_PROGMEM = GSM_NL "+CME ERROR:";
 static const char GSM_CMS_ERROR[] TINY_GSM_PROGMEM = GSM_NL "+CMS ERROR:";
 #endif
@@ -39,24 +46,59 @@ enum RegStatus {
   REG_UNKNOWN      = 4,
 };
 
-template <class modemType>
-class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
-                       public TinyGsmGPRS<TinyGsmSim70xx<modemType>>,
-                       public TinyGsmSMS<TinyGsmSim70xx<modemType>>,
-                       public TinyGsmGPS<TinyGsmSim70xx<modemType>>,
-                       public TinyGsmTime<TinyGsmSim70xx<modemType>>,
-                       public TinyGsmNTP<TinyGsmSim70xx<modemType>>,
-                       public TinyGsmBattery<TinyGsmSim70xx<modemType>>,
-                       public TinyGsmGSMLocation<TinyGsmSim70xx<modemType>> {
-  friend class TinyGsmModem<TinyGsmSim70xx<modemType>>;
-  friend class TinyGsmGPRS<TinyGsmSim70xx<modemType>>;
-  friend class TinyGsmSMS<TinyGsmSim70xx<modemType>>;
-  friend class TinyGsmGPS<TinyGsmSim70xx<modemType>>;
-  friend class TinyGsmTime<TinyGsmSim70xx<modemType>>;
-  friend class TinyGsmNTP<TinyGsmSim70xx<modemType>>;
-  friend class TinyGsmBattery<TinyGsmSim70xx<modemType>>;
-  friend class TinyGsmGSMLocation<TinyGsmSim70xx<modemType>>;
+enum NetworkMode {
+  MODEM_NETWORK_AUTO    = 2,
+  MODEM_NETWORK_GSM     = 13,
+  MODEM_NETWORK_LTE     = 38,
+  MODEM_NETWORK_GSM_LTE = 51,
+  MODEM_NETWORK_UNKNOWN  = 255,
+};
 
+enum NetworkPreferred {
+  MODEM_PREFERRED_CATM       = 1,
+  MODEM_PREFERRED_NB_IOT      = 2,
+  MODEM_PREFERRED_CATM_NBIOT = 3,
+  MODEM_PREFERRED_UNKNOWN = 255,
+};
+
+enum GPSWorkMode {
+  GNSS_MODE_GLONASS  = _BV(0),
+  GNSS_MODE_BDS   = _BV(1),
+  GNSS_MODE_GALILEAN = _BV(2),
+  GNSS_MODE_ALL = 0xF
+};
+
+enum GNSS_OutputPort{
+  NMEA_OUTPUT_DISABLE = 0,
+  NMEA_TO_USB_NMEA_PORT = 1,
+  NMEA_TO_UART3_PORT = 2,
+};
+
+template <class modemType,ModemPlatform model>
+class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType,model>>,
+                       public TinyGsmGPRS<TinyGsmSim70xx<modemType,model>>,
+                       public TinyGsmSMS<TinyGsmSim70xx<modemType,model>>,
+                       public TinyGsmGPS<TinyGsmSim70xx<modemType,model>>,
+                       public TinyGsmTime<TinyGsmSim70xx<modemType,model>>,
+                       public TinyGsmNTP<TinyGsmSim70xx<modemType,model>>,
+                       public TinyGsmBattery<TinyGsmSim70xx<modemType,model>>,
+                       public TinyGsmGSMLocation<TinyGsmSim70xx<modemType,model>>,
+                       public TinyGsmGPSEx<TinyGsmSim70xx<modemType,model>>,
+                       public TinyGsmHttpsSIM7xxx<TinyGsmSim70xx<modemType,model>,model>,
+                       public TinyGsmMqttSIM7xxx<TinyGsmSim70xx<modemType,model>>,
+                       public TinyGsmSSL<TinyGsmSim70xx<modemType,model>> {
+  friend class TinyGsmModem<TinyGsmSim70xx<modemType,model>>;
+  friend class TinyGsmGPRS<TinyGsmSim70xx<modemType,model>>;
+  friend class TinyGsmSMS<TinyGsmSim70xx<modemType,model>>;
+  friend class TinyGsmGPS<TinyGsmSim70xx<modemType,model>>;
+  friend class TinyGsmTime<TinyGsmSim70xx<modemType,model>>;
+  friend class TinyGsmNTP<TinyGsmSim70xx<modemType,model>>;
+  friend class TinyGsmBattery<TinyGsmSim70xx<modemType,model>>;
+  friend class TinyGsmGSMLocation<TinyGsmSim70xx<modemType,model>>;
+  friend class TinyGsmGPSEx<TinyGsmSim70xx<modemType,model>>;
+  friend class TinyGsmHttpsSIM7xxx<TinyGsmSim70xx<modemType,model>,model>;
+  friend class TinyGsmMqttSIM7xxx<TinyGsmSim70xx<modemType,model>>;
+  friend class TinyGsmSSL<TinyGsmSim70xx<modemType,model>>;
   /*
    * CRTP Helper
    */
@@ -83,20 +125,63 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
   }
 
   String getModemNameImpl() {
-    String name = "SIMCom SIM7000";
+    String name = "UNKNOWN";
+    String res;
 
-    thisModem().sendAT(GF("+GMM"));
-    String res2;
-    if (thisModem().waitResponse(5000L, res2) != 1) { return name; }
-    res2.replace(GSM_NL "OK" GSM_NL, "");
-    res2.replace("_", " ");
-    if (res2.startsWith("AT+GMM")) {
-      // https://github.com/Xinyuan-LilyGO/LilyGo-T-SIM7080G/issues/44
-      res2 = res2.substring(6);
+    thisModem().sendAT(GF("E0"));  // Echo Off
+    thisModem().waitResponse();
+
+    thisModem().sendAT("+SIMCOMATI");
+    if (thisModem().waitResponse(10000L, res) != 1) {
+      DBG("MODEM STRING NO FOUND!");
+      return name;
     }
-    res2.trim();
 
-    name = res2;
+  /*
+  * String simple
+  * 
+  * AT+SIMCOMATI
+  * 
+  * Revision:1951B16SIM7080
+  * CSUB:B16V01
+  * APRev:1951B16SIM7080,B16V01
+  * QCN:SIM7080G_P1.03_20210823
+  * IMEI:xxxxxxxxxxxxxx
+  * 
+  * Revision:1529B10SIM7000G 
+  * CSUB:V02
+  * APRev:1529B10SIM7000,V02
+  * QCN:MDM9206_TX3.0.SIM7000G_P1.03C_20240911
+  * IMEI:xxxxxxxxxxxxxx
+  * 
+  * * */
+
+    String prefix = "SIM70";
+    int index = 0;
+    while (index < res.length()) {
+      int startPos = res.indexOf(prefix, index);
+      if (startPos == -1) {
+        break; 
+      }
+      int endPos = res.indexOf('_', startPos);
+      if (endPos == -1) {
+        endPos = res.indexOf('\n', startPos);
+        if (endPos == -1) {
+          endPos = res.length();
+        }
+      }
+      String modelString = res.substring(startPos, endPos);
+      if (modelString.length() > prefix.length()) {
+        index = modelString.indexOf('\n');
+        if(index != -1){
+          name = modelString.substring(0, index - 1);
+        }else{
+          name = modelString;
+        }
+        break;
+      }
+      index = endPos + 1;
+    }
     return name;
   }
 
@@ -152,8 +237,7 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
    */
  public:
   RegStatus getRegistrationStatus() {
-    RegStatus epsStatus =
-        (RegStatus)thisModem().getRegistrationStatusXREG("CEREG");
+    RegStatus epsStatus = (RegStatus)thisModem().getRegistrationStatusXREG("CEREG");
     // If we're connected on EPS, great!
     if (epsStatus == REG_OK_HOME || epsStatus == REG_OK_ROAMING) {
       return epsStatus;
@@ -170,58 +254,61 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
     return (s == REG_OK_HOME || s == REG_OK_ROAMING);
   }
 
- public:
-  String getNetworkModes() {
-    // Get the help string, not the setting value
-    thisModem().sendAT(GF("+CNMP=?"));
-    if (thisModem().waitResponse(GF(GSM_NL "+CNMP:")) != 1) { return ""; }
-    String res = stream.readStringUntil('\n');
-    thisModem().waitResponse();
-    return res;
-  }
-
-  int16_t getNetworkMode() {
+public:
+  NetworkMode getNetworkMode() {
     thisModem().sendAT(GF("+CNMP?"));
-    if (thisModem().waitResponse(GF(GSM_NL "+CNMP:")) != 1) { return false; }
+    if (thisModem().waitResponse(GF(GSM_NL "+CNMP:")) != 1) { return MODEM_NETWORK_UNKNOWN; }
     int16_t mode = thisModem().streamGetIntBefore('\n');
     thisModem().waitResponse();
-    return mode;
+    return static_cast<NetworkMode>(mode);
   }
 
-  bool setNetworkMode(uint8_t mode) {
-    // 2 Automatic
-    // 13 GSM only
-    // 38 LTE only
-    // 51 GSM and LTE only
+  bool setNetworkMode(NetworkMode mode) {
     thisModem().sendAT(GF("+CNMP="), mode);
     return thisModem().waitResponse() == 1;
   }
 
-  String getPreferredModes() {
-    // Get the help string, not the setting value
-    thisModem().sendAT(GF("+CMNB=?"));
-    if (thisModem().waitResponse(GF(GSM_NL "+CMNB:")) != 1) { return ""; }
-    String res = stream.readStringUntil('\n');
-    thisModem().waitResponse();
-    return res;
-  }
-
-  int16_t getPreferredMode() {
-    thisModem().sendAT(GF("+CMNB?"));
-    if (thisModem().waitResponse(GF(GSM_NL "+CMNB:")) != 1) { return false; }
-    int16_t mode = thisModem().streamGetIntBefore('\n');
-    thisModem().waitResponse();
-    return mode;
-  }
-
-  bool setPreferredMode(uint8_t mode) {
-    // 1 CAT-M
-    // 2 NB-IoT
-    // 3 CAT-M and NB-IoT
+  bool setPreferredMode(NetworkPreferred mode) {
     thisModem().sendAT(GF("+CMNB="), mode);
     return thisModem().waitResponse() == 1;
   }
 
+  NetworkPreferred getPreferredMode() {
+    thisModem().sendAT(GF("+CMNB?"));
+    if (thisModem().waitResponse(GF(GSM_NL "+CMNB:")) != 1) { return MODEM_PREFERRED_UNKNOWN; }
+    int16_t mode = thisModem().streamGetIntBefore('\n');
+    thisModem().waitResponse();
+    return static_cast<NetworkPreferred>(mode);
+  }
+
+  String getNetworkModeString() {
+    NetworkMode mode = getNetworkMode();
+    switch (mode)
+    {
+    case MODEM_NETWORK_AUTO: return "Automatic";
+    case MODEM_NETWORK_GSM: return "GSM";
+    case MODEM_NETWORK_LTE: return "LTE";
+    case MODEM_NETWORK_GSM_LTE: return "GSM and LTE";
+    default:
+      break;
+    }
+    return "UNKNOWN";
+  }
+
+  String getPreferredModeString() {
+    NetworkPreferred mode = getPreferredMode();
+    switch (mode)
+    {
+    case MODEM_PREFERRED_CATM: return "CAT-M";
+    case MODEM_PREFERRED_NB_IOT: return "NB-IOT";
+    case MODEM_PREFERRED_CATM_NBIOT: return "CAT-M and NB-IOT";
+    default:
+      break;
+    }
+    return "UNKNOWN";
+  }
+
+ public:
   bool getNetworkSystemMode(bool& n, int16_t& stat) {
     // n: whether to automatically report the system mode info
     // stat: the current service. 0 if it not connected
@@ -243,15 +330,69 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
     return thisModem().getLocalIPImpl();
   }
 
-  bool setNetworkActive(){
+  bool setNetworkDeactivate() {
+    return thisModem().setNetworkDeactivateImpl();
+  }
+
+  bool enableIP4() {
+    // TODO: to be implemented
+    return true;  
+  }
+
+  bool enableIP6() {
+    // TODO: to be implemented
+    return true;
+  }
+
+  bool setNetworkActive(String apn = "",bool useIPV6 = false) {
+
+    // Disable network
+    setNetworkDeactivate();
+
+
+    if(useIPV6){
+      if(apn != ""){
+        if(setNetworkAPN_IPV6(apn) == false) {
+          return false;
+        }
+      }
+      if(enableIP6() == false){
+        return false;
+      }
+    } else {
+      if(apn != ""){
+        if(setNetworkAPN(apn) == false) {
+          return false;
+        }
+      }
+      if(enableIP4() == false){
+        return false;
+      }
+    }
+
     return thisModem().setNetworkActiveImpl();
   }
 
-  String getNetworkActive(){
+  bool getNetworkActive() {
     return thisModem().getNetworkActiveImpl();
   }
 
-  String getNetworkAPN(){
+  bool setNetworkAPN(String apn) {
+    thisModem().sendAT("+CGDCONT=1,\"IP\",\"", apn, "\"");
+    return waitResponse() == 1;
+  }
+
+  bool setNetworkAPN_IPV6(String apn) {
+    thisModem().sendAT(GF("+CGDCONT=1,\"IPV6\",\""), apn, "\"");
+    return thisModem().waitResponse() == 1;
+  }
+
+  bool setNetworkAPN_IPV4V6(String apn) {
+    thisModem().sendAT(GF("+CGDCONT=1,\"IPV4V6\",\""), apn, "\"");
+    return thisModem().waitResponse() == 1;
+  }
+  
+  String getNetworkAPN() {
     thisModem().sendAT("+CGNAPN");
     if (waitResponse(GF(GSM_NL "+CGNAPN:")) != 1) { return ""; }
     thisModem().streamSkipUntil('\"');
@@ -260,14 +401,43 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
     return res;
   }
 
+  /*
+  * <URL> String type :Address of the remote host
+  * <count> The number of Ping Echo Requset to send, range: 1~500
+  * <size> Number of data bytes to send, range: 1~1400
+  * <timeout> Ping request timeout value (in ms),range:0-60000
+  * <replyId> Echo Reply number
+  * <IP Address> IP Address of the remote host
+  * <replyTime> Time, in ms, required to receive the response
+  */
+  int ping(const char* url, String& resolved_ip_addr, uint32_t& rep_data_packet_size,
+           uint32_t& tripTime, uint8_t& TTL) {
+            
+    uint8_t  dest_addr_type   = 1;
+    uint8_t  num_pings        = 1;
+    uint8_t  data_packet_size = 64;
+    uint32_t interval_time    = 1000;
+    uint32_t wait_time        = 10000;
+    uint8_t  ttl              = 0xFF;
 
+    thisModem().sendAT("+SNPING4=\"", url, "\"", ",", num_pings, ",", data_packet_size, ",",interval_time);
+
+    if (thisModem().waitResponse(10000UL, "+SNPING4: ") == 1) {
+      thisModem().streamGetIntBefore(',');  //replyId
+      resolved_ip_addr     = stream.readStringUntil(','); //IP address
+      tripTime             = thisModem().streamGetIntBefore('\r'); //replyTime
+      if (thisModem().waitResponse() != 1) { return -1; }
+      rep_data_packet_size = data_packet_size;
+      return 1;
+    }
+    return -1;
+  }
   /*
    * GPRS functions
    */
  protected:
   // should implement in sub-classes
-  bool gprsConnectImpl(const char* apn, const char* user = NULL,
-                       const char* pwd = NULL) {
+  bool gprsConnectImpl(const char* apn, const char* user = NULL, const char* pwd = NULL) {
     return thisModem().gprsConnectImpl(apn, user, pwd);
   }
 
@@ -288,6 +458,89 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
     res.trim();
     return res;
   }
+  /*
+   * FS functions
+   */
+ protected:
+  bool modemFsInit() {
+    thisModem().sendAT("+CFSINIT");
+    return thisModem().waitResponse(3000UL) == 1;
+  }
+
+  bool moodemFsEnd() {
+    thisModem().sendAT("+CFSTERM");
+    return thisModem().waitResponse(3000UL) == 1;
+  }
+
+  /*
+   * SSL functions
+   */
+  bool downloadCertificateImpl(String filename, const char* buffer) {
+    if (!filename.endsWith(".pem") && !filename.endsWith(".crt")) {
+      DBG("The file name must have type like \".pem\" or \".crt\". ");
+      return false;
+    }
+    int filename_length = filename.length() - 4;
+    if (filename_length < 5 || filename_length > 50) {
+      DBG("File name length should less or equal 50 characters.");
+      return false;
+    }
+
+    modemFsInit();
+
+    thisModem().sendAT("+CFSWFILE=3,", "\"", filename, "\",", "0,", strlen(buffer), ",10000");
+    if (thisModem().waitResponse(10000UL, "DOWNLOAD") == 1) {
+      stream.write(buffer);
+    } else {
+      moodemFsEnd();
+      return false;
+    }
+
+    if (thisModem().waitResponse(3000UL) != 1) {
+      DBG("Download certificate failed !");
+      moodemFsEnd();
+      return false;
+    }
+    return moodemFsEnd();
+  }
+
+  bool deleteCertificateImpl(const char* filename) {
+    modemFsInit();
+
+    thisModem().sendAT("+CFSDFILE=3,\"", filename, "\"");
+    if (thisModem().waitResponse(3000UL) != 1) {
+      DBG("Delete certificate failed !");
+      moodemFsEnd();
+      return false;
+    }
+
+    return moodemFsEnd();
+  }
+
+  bool sslConfigVersionImpl(uint8_t ctxindex, uint8_t ssl_version) {
+    thisModem().sendAT("+CSSLCFG=\"sslversion\",", ctxindex, ',', ssl_version);
+    return (thisModem().waitResponse(5000UL) == 1);
+  }
+
+  bool sslConfigSniImpl(uint8_t ctxindex, const char* server_name) {
+    thisModem().sendAT("+CSSLCFG=\"sni\",", ctxindex, ",\"", server_name, '"');
+    return (thisModem().waitResponse(5000UL) == 1);
+  }
+
+  // <ssltype>
+  // 1 QAPI_NET_SSL_CERTIFICATE_E
+  // 2 QAPI_NET_SSL_CA_LIST_E
+  // 3 QAPI_NET_SSL_PSK_TABLE_E
+  bool convertCertificateImpl(uint8_t ssl_type, const char* cert_filename,
+                              const char* private_key_filename = NULL) {
+    if (cert_filename && private_key_filename) {
+      thisModem().sendAT("+CSSLCFG=convert,", ssl_type, ",", cert_filename, ",",
+             private_key_filename);
+    } else if (cert_filename) {
+      thisModem().sendAT("+CSSLCFG=convert,", ssl_type, ",", cert_filename);
+    }
+    return (thisModem().waitResponse(5000UL) == 1);
+  }
 
   /*
    * Messaging functions
@@ -302,7 +555,15 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
   // enable GPS
   bool enableGPSImpl(int8_t power_en_pin ,uint8_t enable_level) {
     if(power_en_pin != -1){
-      thisModem().sendAT("+CGPIO=0,",power_en_pin,",1,",enable_level);
+      if(model == QUALCOMM_SIM7080G){
+        thisModem().sendAT("+SGPIO=0,",power_en_pin,",1,",enable_level);
+        thisModem().waitResponse(3000);
+        // For older firmware versions of the SIM7070G, the new version's control GPIO is unavailable.
+        thisModem().sendAT("+CGPIO=0,",power_en_pin,",1,",enable_level);
+        thisModem().waitResponse(3000);
+      }else{
+        thisModem().sendAT("+CGPIO=0,",power_en_pin,",1,",enable_level);
+      }
       thisModem().waitResponse();
     } 
     thisModem().sendAT(GF("+CGNSPWR=1"));
@@ -310,9 +571,13 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
     return true;
   }
 
-  bool disableGPSImpl(int8_t power_en_pin ,uint8_t disbale_level) {
+  bool disableGPSImpl(int8_t power_en_pin ,uint8_t disable_level) {
     if(power_en_pin != -1){
-      thisModem().sendAT("+CGPIO=0,",power_en_pin,",1,",disbale_level);
+      if(model == QUALCOMM_SIM7080G){
+        thisModem().sendAT("+SGPIO=0,",power_en_pin,",1,",disable_level);
+      }else{
+        thisModem().sendAT("+CGPIO=0,",power_en_pin,",1,",disable_level);
+      }
       thisModem().waitResponse();
     } 
     thisModem().sendAT(GF("+CGNSPWR=0"));
@@ -320,83 +585,208 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
     return true;
   }
 
-  bool isEnableGPSImpl(){
+  bool isEnableGPSImpl() {
     thisModem().sendAT(GF("+CGNSPWR?"));
     if (thisModem().waitResponse(GF(GSM_NL "+CGNSPWR:")) != 1) { return false; }
-    return 1 == thisModem().streamGetIntBefore('\r'); 
+    bool running = 1 == thisModem().streamGetIntBefore('\r');
+    thisModem().waitResponse();
+    return running;
   }
 
-  bool setGPSBaudImpl(uint32_t baud){
-    DBG("Modem does not support set GPS baudrate.");
-    return  false;
+  bool setGPSBaudImpl(uint32_t baud) {
+    if(model == QUALCOMM_SIM7080G){
+      //TODO:
+      return true;
+    }
+    thisModem().sendAT("+CGNSUTIPR=",baud);
+    return thisModem().waitResponse(1000UL) == 1;
   }
 
-  bool setGPSModeImpl(uint8_t mode){
-      thisModem().sendAT("+CGNSMOD=1,1,1,1");
-      return waitResponse(1000L) == 1;
+  bool setGPSModeImpl(uint8_t mode) {
+    if(model == QUALCOMM_SIM7080G){
+      //TODO:
+      return true;
+    }
+    thisModem().sendAT("+CGNSMOD=1,", 
+                        (mode & GNSS_MODE_GLONASS)  ? "1" : "0", ',',
+                        (mode & GNSS_MODE_BDS)   ? "1" : "0", ',',
+                        (mode & GNSS_MODE_GALILEAN) ? "1" : "0");
+    return waitResponse(1000L) == 1;
   }
 
-  bool setGPSOutputRateImpl(uint8_t rate_hz){
-    DBG("Modem does not support set GPS output rate.");
-    return  false;
+  bool setGPSOutputRateImpl(uint8_t rate_hz) {
+    if(model == QUALCOMM_SIM7080G){
+      //TODO:
+      return true;
+    }
+    if (rate_hz <= 0) {
+        return false; 
+    }
+    double periodMs = 1000.0 / rate_hz;
+    int roundedMs = (int)round(periodMs);
+    if (roundedMs < 50) {
+        periodMs = 50;
+    } else if (roundedMs > 1000) {
+        periodMs = 1000;
+    } 
+    thisModem().sendAT("+CGNSRTMS=",periodMs);
+    return thisModem().waitResponse(1000UL) == 1;
   }
 
-  bool enableNMEAImpl(){
+  bool enableNMEAImpl(bool outputAtPort) {
+    if(model == QUALCOMM_SIM7080G){
+      //TODO:
+      return true;
+    }
     // 7070G 2019.11.07 Delete commands,see datasheet  Version History
     thisModem().sendAT("+CGNSPORT=3");
     thisModem().waitResponse(1000UL);
 
     thisModem().sendAT("+CGNSMOD=1,1,1,1");
-    if (thisModem().waitResponse(1000UL) !=  1) {
-        return false;
-    }
+    if (thisModem().waitResponse(1000UL) != 1) { return false; }
 
     // 7070G 2019.11.07 Delete commands,see datasheet  Version History
     thisModem().sendAT("+CGNSCFG=2");
     thisModem().waitResponse(1000UL);
 
     thisModem().sendAT("+CGNSTST=1");
-    if (thisModem().waitResponse(1000UL) !=  1) {
-        return false;
-    }
-    
+    if (thisModem().waitResponse(1000UL) != 1) { return false; }
+
     thisModem().sendAT("+CGNSPWR=1");
-    if (thisModem().waitResponse(1000UL) !=  1) {
-        return false;
-    }
+    if (thisModem().waitResponse(1000UL) != 1) { return false; }
     return true;
   }
 
-  bool disableNMEAImpl(){
+  bool disableNMEAImpl() {
+    if(model == QUALCOMM_SIM7080G){
+      // TODO:
+      return true;
+    }
     thisModem().sendAT("+CGNSTST=0");
     return thisModem().waitResponse(1000L) == 1;
   }
 
-  bool configNMEASentenceImpl(bool CGA,bool GLL,bool GSA,bool GSV,bool RMC,bool VTG,bool ZDA,bool ANT){
-    return false;
+  bool configNMEASentenceImpl(uint32_t nmea_mask){
+    if(model == QUALCOMM_SIM7080G){
+      // TODO:
+      thisModem().sendAT("+SGNSCFG=\"NMEATYPE\",",nmea_mask);
+    }else{
+      thisModem().sendAT("+CGNSNMEA=",nmea_mask);
+    }
+    return thisModem().waitResponse(1000L) == 1;
   }
-  
+
   // get the RAW GPS output
   String getGPSrawImpl() {
     thisModem().sendAT(GF("+CGNSINF"));
     if (thisModem().waitResponse(10000L, GF(GSM_NL "+CGNSINF:")) != 1) {
       return "";
-    }
+    }    
     String res = stream.readStringUntil('\n');
     thisModem().waitResponse();
     res.trim();
     return res;
   }
 
+  bool gpsColdStartImpl() {
+    thisModem().sendAT(GF("+CGNSCOLD"));
+    if (thisModem().waitResponse(10000L) != 1) { return false; }
+    return true;
+  }
+
+  bool gpsWarmStartImpl() {
+    thisModem().sendAT(GF("+CGNSWARM"));
+    if (thisModem().waitResponse(10000L) != 1) { return false; }
+    return true;
+  }
+
+  bool gpsHotStartImpl() {
+    thisModem().sendAT(GF("+CGNSHOT"));
+    if (thisModem().waitResponse(10000L) != 1) { return false; }
+    return true;
+  }
+
+  bool getGPS_ExImpl(GPSInfo& info) {
+    float lat = 0;
+    float lon = 0;
+    memset(&info, 0, sizeof(info));
+    // GNSS Navigation Information Parsed From NMEA Sentences
+    // SIM7000G +CGNSINF: <GNSS run status>,<Fix status>,<UTC date & Time>,<Latitude>,<Longitude>,<MSL Altitude>,<Speed Over Ground>,<Course Over Ground>,<FixMode>,<Reserved1>,<HDOP>,<PDOP>,<VDOP>,<Reserved2>,<GNSS Satellites in View>,<GNSSS atellites Used>,<GLONASSS atellites Used>,<Reserved3>,<C/N0 max>,<HPA>,<VPA>
+    // SIM7080G +CGNSINF: <GNSS run status>,<Fix status>,<UTC date & Time>,<Latitude>,<Longitude>,<MSL Altitude>,<Speed Over Ground>,<Course Over Ground>,<FixMode>,<Reserved1>,<HDOP>,<PDOP>,<VDOP>,<Reserved2>,<GNSS Satellites in View>,<Reserved3>,<HPA>,<VPA>
+    // SIM7070G +CGNSINF: <GNSS run status>,<Fix status>,<UTC date & Time>,<Latitude>,<Longitude>,<MSL Altitude>,<Speed Over Ground>,<Course Over Ground>,<FixMode>,<Reserved1>,<HDOP>,<PDOP>,<VDOP>,<Reserved2>,<GNSS Satellites in View>,<Reserved3>,<HPA>,<VPA>
+    // +CGNSINF: 1,1,20251028032811.000,11.655862,123.060223,83.599,0.00,,0,,1.3,1.5,0.9,,8,,25.5,15.5
+
+
+    thisModem().sendAT(GF("+CGNSINF"));
+    if (thisModem().waitResponse(GF(GSM_NL "+CGNSINF: ")) != 1) { return false; }
+
+    // <GNSS run status>
+    bool running = thisModem().streamGetIntBefore(',');
+    if (!running) {
+      log_e("GPS NOT START");
+      return false;
+    }
+    // <Fix status>
+    info.isFix = thisModem().streamGetIntBefore(',');
+    if (info.isFix == 1) {
+      // UTC date & Time
+      info.year   = thisModem().streamGetIntLength(4);    // Four digit year
+      info.month  = thisModem().streamGetIntLength(2);    // Two digit month
+      info.day    = thisModem().streamGetIntLength(2);    // Two digit day
+      info.hour   = thisModem().streamGetIntLength(2);    // Two digit hour
+      info.minute = thisModem().streamGetIntLength(2);    // Two digit minute
+      float secondWithSS = thisModem().streamGetFloatBefore(',');  // 6 digit second with subseconds
+      info.second = static_cast<int>(secondWithSS);
+      info.latitude  = thisModem().streamGetFloatBefore(',');  // Latitude
+      info.longitude = thisModem().streamGetFloatBefore(',');  // Longitude
+      info.altitude  =  thisModem().streamGetFloatBefore(','); // MSL Altitude. Unit is meters
+      info.speed     = thisModem().streamGetFloatBefore(',');  // Speed Over Ground. Unit is knots.
+      info.course    = thisModem().streamGetFloatBefore(',');  // Course Over Ground. Degrees.
+      if(info.course < 0 || info.course >=360){
+        info.course = 0.0;
+      }
+      thisModem().streamSkipUntil(',');                   // FixMode
+      thisModem().streamSkipUntil(',');                   // Reserved1
+      info.HDOP = thisModem().streamGetFloatBefore(',');  // Horizontal Dilution Of Precision
+      if(info.HDOP < 0 || info.HDOP > 100){
+        info.HDOP = 0.0;
+      }
+      info.PDOP = thisModem().streamGetFloatBefore(',');  // Position Dilution Of Precision
+      if(info.PDOP < 0 || info.PDOP > 100){
+        info.PDOP = 0.0;
+      }
+      info.VDOP = thisModem().streamGetFloatBefore(',');  // Vertical Dilution Of Precision
+      if(info.VDOP < 0 || info.VDOP > 100){
+        info.VDOP = 0.0;
+      }
+      thisModem().streamSkipUntil(',');                   // Reserved2
+      info.GSV = thisModem().streamGetIntBefore(',');     // GNSS Satellites in View
+
+      if(model == QUALCOMM_SIM7080G){
+        thisModem().streamSkipUntil(',');                   // Reserved3
+      }else{
+        info.GSU = thisModem().streamGetIntBefore(',');     // GNSS Satellites Used
+        info.glonass_satellite_num = thisModem().streamSkipUntil(',');  // GLONASS Satellites Used
+        thisModem().streamSkipUntil(',');                   // Reserved3
+        thisModem().streamSkipUntil(',');                   // C/N0 max
+      }
+      thisModem().streamSkipUntil(',');                   // HPA
+      thisModem().streamSkipUntil('\n');                  // VPA
+
+      return true;
+    }
+
+    thisModem().waitResponse();
+    return false;
+  }
+
   // get GPS informations
-  bool getGPSImpl(uint8_t *status,float* lat, float* lon, float* speed = 0, float* alt = 0,
-                  int* vsat = 0, int* usat = 0, float* accuracy = 0,
+  bool getGPSImpl(uint8_t* status, float* lat, float* lon, float* speed = 0,
+                  float* alt = 0, int* vsat = 0, int* usat = 0, float* accuracy = 0,
                   int* year = 0, int* month = 0, int* day = 0, int* hour = 0,
                   int* minute = 0, int* second = 0) {
     thisModem().sendAT(GF("+CGNSINF"));
-    if (thisModem().waitResponse(10000L, GF(GSM_NL "+CGNSINF:")) != 1) {
-      return false;
-    }
+    if (thisModem().waitResponse(10000L, GF(GSM_NL "+CGNSINF:")) != 1) { return false; }
     *status = thisModem().streamGetIntLength(1);
     thisModem().streamSkipUntil(',');                // GNSS run status
     if (thisModem().streamGetIntBefore(',') == 1) {  // fix status
@@ -416,28 +806,27 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
       float secondWithSS = 0;
 
       // UTC date & Time
-      iyear        = thisModem().streamGetIntLength(4);  // Four digit year
-      imonth       = thisModem().streamGetIntLength(2);  // Two digit month
-      iday         = thisModem().streamGetIntLength(2);  // Two digit day
-      ihour        = thisModem().streamGetIntLength(2);  // Two digit hour
-      imin         = thisModem().streamGetIntLength(2);  // Two digit minute
-      secondWithSS = thisModem().streamGetFloatBefore(
-          ',');  // 6 digit second with subseconds
+      iyear  = thisModem().streamGetIntLength(4);  // Four digit year
+      imonth = thisModem().streamGetIntLength(2);  // Two digit month
+      iday   = thisModem().streamGetIntLength(2);  // Two digit day
+      ihour  = thisModem().streamGetIntLength(2);  // Two digit hour
+      imin   = thisModem().streamGetIntLength(2);  // Two digit minute
+      secondWithSS =
+          thisModem().streamGetFloatBefore(',');  // 6 digit second with subseconds
 
       ilat = thisModem().streamGetFloatBefore(',');  // Latitude
       ilon = thisModem().streamGetFloatBefore(',');  // Longitude
-      ialt = thisModem().streamGetFloatBefore(
-          ',');  // MSL Altitude. Unit is meters
-      ispeed = thisModem().streamGetFloatBefore(
-          ',');                          // Speed Over Ground. Unit is knots.
-      thisModem().streamSkipUntil(',');  // Course Over Ground. Degrees.
-      thisModem().streamSkipUntil(',');  // Fix Mode
-      thisModem().streamSkipUntil(',');  // Reserved1
-      iaccuracy = thisModem().streamGetFloatBefore(
-          ',');                          // Horizontal Dilution Of Precision
-      thisModem().streamSkipUntil(',');  // Position Dilution Of Precision
-      thisModem().streamSkipUntil(',');  // Vertical Dilution Of Precision
-      thisModem().streamSkipUntil(',');  // Reserved2
+      ialt = thisModem().streamGetFloatBefore(',');  // MSL Altitude. Unit is meters
+      ispeed =
+          thisModem().streamGetFloatBefore(',');  // Speed Over Ground. Unit is knots.
+      thisModem().streamSkipUntil(',');           // Course Over Ground. Degrees.
+      thisModem().streamSkipUntil(',');           // Fix Mode
+      thisModem().streamSkipUntil(',');           // Reserved1
+      iaccuracy =
+          thisModem().streamGetFloatBefore(',');    // Horizontal Dilution Of Precision
+      thisModem().streamSkipUntil(',');             // Position Dilution Of Precision
+      thisModem().streamSkipUntil(',');             // Vertical Dilution Of Precision
+      thisModem().streamSkipUntil(',');             // Reserved2
       ivsat = thisModem().streamGetIntBefore(',');  // GNSS Satellites in View
       iusat = thisModem().streamGetIntBefore(',');  // GNSS Satellites Used
       thisModem().streamSkipUntil(',');             // GLONASS Satellites Used
@@ -470,7 +859,43 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
     thisModem().waitResponse();
     return false;
   }
+public:
 
+  bool configGNSS_OutputPort(GNSS_OutputPort port) {
+    if(model == QUALCOMM_SIM7080G){
+
+      thisModem().sendAT("+SGNSCMD=0");
+      thisModem().waitResponse();
+      
+      thisModem().sendAT("+CGNSPWR=0");
+      thisModem().waitResponse();
+
+      if(port == NMEA_OUTPUT_DISABLE){
+        return true;
+      }
+
+      thisModem().sendAT("+SGNSCFG=\"NMEAOUTPORT\",",port);
+      if (thisModem().waitResponse() != 1) {
+        return false; 
+      }
+
+      thisModem().sendAT("+SGNSCMD=2,1000,0,1");
+      if (thisModem().waitResponse() != 1) {
+        return false; 
+      }
+
+    }else{
+      thisModem().sendAT("+CGNSPWR=1");
+      if(thisModem().waitResponse() != 1){
+        return false;
+      }
+      thisModem().sendAT("+CGNSCFG=",port);
+      if (thisModem().waitResponse() != 1) {
+        return false; 
+      }
+    }
+    return true;
+  }
   /*
    * Time functions
    */
@@ -497,7 +922,7 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
    */
  public:
   // should implement in sub-classes
-  int8_t waitResponse(uint32_t timeout_ms, String& data,
+  int8_t waitResponse(uint32_t timeout_ms, String& data, 
                       GsmConstStr r1 = GFP(GSM_OK),
                       GsmConstStr r2 = GFP(GSM_ERROR),
 #if defined TINY_GSM_DEBUG
@@ -523,7 +948,7 @@ class TinyGsmSim70xx : public TinyGsmModem<TinyGsmSim70xx<modemType>>,
     return thisModem().waitResponse(timeout_ms, data, r1, r2, r3, r4, r5);
   }
 
-  int8_t waitResponse(GsmConstStr r1 = GFP(GSM_OK),
+  int8_t waitResponse(GsmConstStr r1 = GFP(GSM_OK), 
                       GsmConstStr r2 = GFP(GSM_ERROR),
 #if defined TINY_GSM_DEBUG
                       GsmConstStr r3 = GFP(GSM_CME_ERROR),
