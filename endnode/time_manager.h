@@ -2,6 +2,7 @@
 #define TIME_MANAGER_H
 
 #include <Arduino.h>
+#include "tinygsm_yield.h"
 #include <TinyGsmClient.h>
 #include <time.h>
 #include <sys/time.h>

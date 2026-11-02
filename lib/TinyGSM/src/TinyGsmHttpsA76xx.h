@@ -233,7 +233,10 @@ public:
     size_t https_get_size(void)
     {
         thisModem().sendAT("+HTTPREAD?");
-        if (thisModem().waitResponse(120000UL, "+HTTPREAD: LEN,") != 1) {
+        // Local edit (v3.1.0): 20s deadline. waitResponse feeds the task
+        // watchdog through TINY_GSM_YIELD, so a slow modem cannot sit here
+        // for the previous 120s and trip the awake budget.
+        if (thisModem().waitResponse(20000UL, "+HTTPREAD: LEN,") != 1) {
             return 0;
         }
         size_t lenght = thisModem().streamGetLongLongBefore('\r');
