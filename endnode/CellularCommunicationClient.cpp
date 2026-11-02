@@ -57,7 +57,9 @@ bool CellularCommunicationClient::https_begin() {
     return started;
 }
 void CellularCommunicationClient::https_end() { modem.https_end(); }
-bool CellularCommunicationClient::https_set_url(const String& url) { return modem.https_set_url(url); }
+bool CellularCommunicationClient::https_set_url(const String& url) {
+    return modem.https_set_url(url, TINYGSM_SSL_TLS1_2, true);
+}
 bool CellularCommunicationClient::https_add_header(const char* key, const char* value) { return modem.https_add_header(key, value); }
 int CellularCommunicationClient::https_get() { return modem.https_get(); }
 size_t CellularCommunicationClient::https_get_size() { return modem.https_get_size(); }
