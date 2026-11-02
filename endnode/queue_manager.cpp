@@ -1,8 +1,9 @@
 #include <SPI.h>
 #include <SD.h>
 #include "queue_manager.h"
-#include "app_utils.h" // Para is_sd_ready y las rutas de los archivos
-#include "logger.h"    // Para local_logger
+#include "queue_pool.h"
+#include "app_utils.h"
+#include "logger.h"
 
 // ==============================================================================
 // INSTANCIACIÓN DE VARIABLES GLOBALES (Declaradas como extern en el .h)
@@ -200,7 +201,7 @@ void spillover_rtc_to_sd() {
     }
 
     try {
-        local_logger("DERRAME: Moviendo datos de RTC a SD...");
+        local_logger("Spillover: moving RTC data to the SD card...");
         File file = SD.open(QUEUE_FILE, FILE_APPEND);
         if (file) {
             file.print(rtc_payload_pool); // Volcamos todo el buffer
@@ -210,47 +211,22 @@ void spillover_rtc_to_sd() {
             rtc_pool_length = 0;
             rtc_payload_pool[0] = '\0';
             rtc_persist_commit();
-            local_logger("DERRAME: Exitoso. RTC vaciada.");
+            local_logger("Spillover succeeded. RTC cleared.");
         } else {
             add_sd_error("[SPILLOVER_FAIL: SD_OPEN] ");
-            local_logger("DERRAME: Falló al abrir archivo SD.");
+            local_logger("Spillover failed to open the SD file.");
         }
     } catch(const std::exception& e) {
-        local_logger("DERRAME: Excepción al escribir en SD.");
+        local_logger("Spillover exception while writing the SD card.");
         add_sd_error(String("[SPILLOVER_EXC_ERROR: ") + e.what() + "] ");
     }
 }
 
 void drop_oldest_rtc_record() {
     if (rtc_pool_length == 0) return;
-
-    // Buscamos el primer salto de línea (fin del mensaje más viejo)
-    char* first_newline = strchr(rtc_payload_pool, PAYLOAD_DELIMITER);
-    
-    if (first_newline) {
-        int bytes_to_remove = (first_newline - rtc_payload_pool) + 1;
-        int remaining_bytes = rtc_pool_length - bytes_to_remove;
-        if (remaining_bytes < 0 || bytes_to_remove <= 0) {
-            rtc_pool_length = 0;
-            rtc_payload_pool[0] = '\0';
-            rtc_persist_commit();
-            return;
-        }
-        
-        // Desplazamos la memoria hacia la izquierda (sobrescribiendo el viejo)
-        if (remaining_bytes > 0) {
-            memmove(rtc_payload_pool, first_newline + 1, (size_t)remaining_bytes);
-        }
-        rtc_pool_length = remaining_bytes;
-        rtc_payload_pool[rtc_pool_length] = '\0';
-        rtc_persist_commit();
-        local_logger("RTC LLENA (SIN SD): Dato más viejo descartado (Ring Buffer).");
-    } else {
-        // Fallback por si hay un string malformado sin delimitador
-        rtc_pool_length = 0; 
-        rtc_payload_pool[0] = '\0';
-        rtc_persist_commit();
-    }
+    rtc_pool_length = queue_pool_drop_oldest(rtc_payload_pool, rtc_pool_length, PAYLOAD_DELIMITER);
+    rtc_persist_commit();
+    local_logger("RTC full without SD. Dropped the oldest record.");
 }
 
 // ==============================================================================
@@ -278,13 +254,13 @@ void queue_manager_init() {
         delay(300); // Wait to ensure SPI is ready before SD init
         // Intentamos montar el sistema de archivos de la tarjeta SD
         if (!SD.begin(BOARD_SD_CS_PIN, SPI)) { 
-            local_logger("Fallo crítico al montar SD Card en el arranque.");
+            local_logger("SD card mount failed at startup.");
             is_sdcard_ok = false; // Nuestra bandera global que gatillará el diagnóstico en el setup()
             
             // Agregamos el error al log RTC que viajará en el próximo payload
             add_sd_error("[QM_INIT: SD_MOUNT_FAIL]"); 
         } else {
-            local_logger("SD Card montada e inicializada correctamente.");
+            local_logger("SD card mounted.");
             // Verificación de salud rápida: comprobar si el archivo de cola existe
             // Si no existe, lo creamos vacío para evitar errores posteriores de "File not found"
             if (!SD.exists(QUEUE_FILE)) {
@@ -292,7 +268,7 @@ void queue_manager_init() {
                 if (file) {
                     is_sdcard_ok = true;
                     file.close();
-                    local_logger("Archivo QUEUE_FILE base creado.");
+                    local_logger("Queue file created.");
                 }
             }
             recover_sd_queue_files();
@@ -304,7 +280,7 @@ void queue_manager_init() {
             }
         }
     } catch(const std::exception& e) {
-        local_logger("Excepción durante la inicialización de SD Card.");
+        local_logger("Exception during SD card init.");
         add_sd_error(String("[QM_INIT_SD_ERROR: ") + e.what() + "] ");
         is_sdcard_ok = false;
     }
@@ -353,13 +329,16 @@ void queue_payload(String payload) {
     }
 
     // 3. Insertar el nuevo payload al final del pool de la RTC
-    memcpy(rtc_payload_pool + rtc_pool_length, payload.c_str(), (size_t)payload_len);
-    rtc_pool_length += payload_len;
-    rtc_payload_pool[rtc_pool_length] = '\0';
+    int pooled = rtc_pool_length;
+    if (!queue_pool_append(rtc_payload_pool, &pooled, MAX_RTC_BUFFER_SIZE, payload.c_str(), payload_len)) {
+        add_sd_error("[QP_REJECT: NO_ROOM]");
+        return;
+    }
+    rtc_pool_length = pooled;
     rtc_persist_commit();
     
     #ifdef DEBUG
-    local_logger("Guardado en RTC. Uso actual: ", rtc_pool_length, "/", MAX_RTC_BUFFER_SIZE, " bytes");
+    local_logger("Stored in RTC. Used ", rtc_pool_length, "/", MAX_RTC_BUFFER_SIZE, " bytes");
     #endif
 }
 
@@ -377,7 +356,7 @@ bool has_pending_data() {
                 }
             }
         } catch(const std::exception& e) {
-            local_logger("Excepción al verificar datos pendientes en SD.");
+            local_logger("Exception while checking the SD queue.");
             add_sd_error(String("[HAS_PENDING_SD_ERROR: ") + e.what() + "] ");
         }
     } else {
@@ -455,7 +434,7 @@ String get_batch_payload() {
                 }
             }
         } catch(const std::exception& e) {
-            local_logger("Excepción al leer lote de SD.");
+            local_logger("Exception while reading an SD batch.");
             add_sd_error(String("[GET_BATCH_SD_ERROR: ") + e.what() + "] ");
         }
     } else {
@@ -485,7 +464,7 @@ void commit_batch() {
         rtc_pool_length = remaining_bytes;
         rtc_payload_pool[rtc_pool_length] = '\0'; // Asegurar fin de string
         rtc_persist_commit();
-        local_logger("COMMIT: ", current_batch_count, " lecturas borradas de la RTC.");
+        local_logger("Commit: ", current_batch_count, " lecturas borradas de la RTC.");
     } 
     else if (ensure_sd_active()) {
         try {
@@ -498,7 +477,7 @@ void commit_batch() {
             if (sd_read_offset >= SD_QUEUE_COMPACT_WASTE || size > SD_QUEUE_CAP_BYTES) {
                 enforce_sd_cap();
             }
-            local_logger("COMMIT: Offset SD actualizado. Lote eliminado.");
+            local_logger("Commit: Offset SD actualizado. Lote eliminado.");
         }
         catch(const std::exception& e){
             add_sd_error(String("[COMMIT_BATCH_FAIL: ") + e.what() + "] ");
@@ -514,7 +493,7 @@ void commit_batch() {
 void rollback_batch() {
     if (current_batch_count == 0) return;
 
-    local_logger("ROLLBACK: Falló el envío. Protegiendo datos...");
+    local_logger("Rollback: publish failed. Keeping the data...");
     
     // Si los datos venían de la RTC y la SD está sana, forzamos un derrame 
     // total a la SD para asegurar los datos antes del Deep Sleep.

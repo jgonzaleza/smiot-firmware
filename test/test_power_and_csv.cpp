@@ -1,5 +1,6 @@
 #include "csv_parse.h"
 #include "power_policy.h"
+#include "queue_pool.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -76,12 +77,35 @@ static void test_missing_pack_keeps_backend() {
     expect(!decision.changed, "mode unchanged");
 }
 
+static void test_queue_pool_drops_oldest_and_rejects_oversize() {
+    char pool[32];
+    memset(pool, 0, sizeof(pool));
+    int length = 0;
+    expect(queue_pool_append(pool, &length, 32, "one\n", 4), "append one");
+    expect(queue_pool_append(pool, &length, 32, "two\n", 4), "append two");
+    expect(strcmp(pool, "one\ntwo\n") == 0, "pool text");
+    length = queue_pool_drop_oldest(pool, length, '\n');
+    expect(strcmp(pool, "two\n") == 0, "oldest dropped");
+    expect(length == 4, "length after drop");
+    char big[40];
+    memset(big, 'x', sizeof(big));
+    int big_len = 0;
+    expect(!queue_pool_append(big, &big_len, 32, big, 32), "reject payload that fills the pool");
+    char tight[8];
+    memset(tight, 0, sizeof(tight));
+    int tight_len = 0;
+    expect(queue_pool_append(tight, &tight_len, 8, "abcd\n", 5), "fits with room for NUL");
+    expect(!queue_pool_append(tight, &tight_len, 8, "zzzz", 4), "no room for the next record");
+    expect(strcmp(tight, "abcd\n") == 0, "tight pool unchanged");
+}
+
 int main() {
     test_csv_keeps_last_token();
     test_csv_bounds();
     test_critical_blocks_radio();
     test_low_has_hysteresis();
     test_missing_pack_keeps_backend();
+    test_queue_pool_drops_oldest_and_rejects_oversize();
     if (failures) {
         printf("%d failed\n", failures);
         return 1;

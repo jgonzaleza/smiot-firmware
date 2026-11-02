@@ -118,7 +118,7 @@ inline bool ensure_sd_active() {
     // If already initialized, do nothing
     if (is_sdcard_ok) return true;
 
-    local_logger("Mounting SD Card (Lazy Init)...");
+    local_logger("Mounting SD card...");
     
     // Init SPI with Lilygo Pins
     try {
@@ -129,12 +129,12 @@ inline bool ensure_sd_active() {
         for(int i=0; i<3; i++){
             if (SD.begin(BOARD_SD_CS_PIN, SPI)) {            
                 is_sdcard_ok = true;
-                local_logger("Mounting SD Card Success!");
+                local_logger("SD card mounted.");
                 return true;
             }
         }
     } catch(const std::exception& e) {
-        local_logger("Exception during SD Card initialization: ", e.what());
+        local_logger("Exception during SD card init: ", e.what());
         add_sd_error(String("[ENSURE_SD_EXC: ") + e.what() + "] ");
     }
     return false;
@@ -142,7 +142,7 @@ inline bool ensure_sd_active() {
 
 // Reset the rain sensor by toggling a GPIO pin
 inline void reset_sensor() {
-    local_logger("RESET RAIN SENSOR . . .");
+    local_logger("Resetting the rain sensor.");
     pinMode(RESET_RAIN_SENSOR_PIN, OUTPUT);
     digitalWrite(RESET_RAIN_SENSOR_PIN, HIGH);
     delay(5000);
@@ -167,12 +167,12 @@ inline void turn_sensors_off(){
 
 // Forcefully disconnect GPRS session
 inline void force_modem_disconnect(TinyGsm& modem) {
-    local_logger("Terminating Network Session...");
+    local_logger("Terminating the network session...");
 
     // This tells the tower: "I am leaving the data network completely."
     modem.sendAT(GF("+CGATT=0"));
     if (modem.waitResponse(10000L) == 1) {
-        local_logger("Network Detached.");
+        local_logger("Network detached.");
     }
 }
 
@@ -180,7 +180,7 @@ inline void force_modem_disconnect(TinyGsm& modem) {
 // RUTINA DE DIAGNÓSTICO Y REPARACIÓN DE SD CARD
 // ==============================================================================
 inline bool diagnose_and_repair_sd() {
-    local_logger("Iniciando autodiagnóstico de SD Card...");
+    local_logger("Starting SD card self-test...");
     bool is_healthy = true;
     
     // 1. Prueba de Montaje Inicial
@@ -189,7 +189,7 @@ inline bool diagnose_and_repair_sd() {
         is_healthy = false;
         
         // INTENTO DE REPARACIÓN FÍSICA: Reiniciar el Bus SPI
-        local_logger("Intentando reset del bus SPI...");
+        local_logger("Resetting the SPI bus...");
         SD.end();
         SPI.end();
         delay(200);
@@ -221,11 +221,11 @@ inline bool diagnose_and_repair_sd() {
         if (rw_ok) {
             // Limpiar la prueba
             SD.remove(test_file); 
-            local_logger("Diagnóstico SD: PASADO (Lectura/Escritura OK)");
+            local_logger("SD diagnostic passed.");
             return true;
         } else {
             add_sd_error("[DIAG: RW_TEST_FAIL] ");
-            local_logger("Diagnóstico SD: FALLÓ escritura. Posible corrupción de archivos.");
+            local_logger("SD diagnostic failed while writing.");
             is_healthy = false;
         }
     }
@@ -233,7 +233,7 @@ inline bool diagnose_and_repair_sd() {
     // 3. Reparación Lógica ("Soft Format" / Wipe)
     // Llegamos aquí si la SD montó pero no permite escribir. Los archivos pueden estar corruptos.
     if (!is_healthy) {
-        local_logger("Intentando Reparación Lógica (Borrando archivos de trabajo)...");
+        local_logger("Trying a logical repair by deleting work files...");
         add_sd_error("[DIAG: ATTEMPT_WIPE] ");
         
         bool w1 = SD.remove(QUEUE_FILE);
@@ -252,11 +252,11 @@ inline bool diagnose_and_repair_sd() {
             file.close();
             SD.remove("/test_rw.txt");
             add_sd_error("[DIAG: RECOVERY_SUCCESS] ");
-            local_logger("Reparación Exitosa!");
+            local_logger("SD repair succeeded.");
             return true;
         } else {
             add_sd_error("[DIAG: RECOVERY_FAIL] ");
-            local_logger("La tarjeta requiere reemplazo o formateo manual en PC.");
+            local_logger("The card needs replacement or a format on a PC.");
             return false;
         }
     }
