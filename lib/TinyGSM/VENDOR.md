@@ -18,4 +18,6 @@ No separate local delta could be extracted from the 3.0.0 import: the snapshot i
 
 - `https_get_size()` waits at most 20 seconds instead of 120. The A7608 `waitResponse` loop calls `TINY_GSM_YIELD()`, which the firmware defines to feed the task watchdog.
 
-The N/S and E/W GPS sign is applied in `TinyGsmClientA7608.h` (v3.2.0). South and west readings are stored as negative degrees. The diff is `patches/v3.2.0-gps-sign.patch`.
+The HTTPS CA check for context 1 (`sslversion` 3, SNI, `cacert`, `authmode` 1, then `https_set_ssl_index(1)`) and the MQTT `sslversion` 3 change are applied on this snapshot.
+
+LilyGO commit `d6165e3` reports TinyGSM 1.0.0 in `lib/TinyGSM/library.json`. A sparse fetch of that commit failed (`couldn't find remote ref d6165e3` on a depth-1 clone), so the 1.0.0 tree was not swapped in. Replacing `TinyGsmHttpsA76xx.h` with `TinyGsmHttpsComm.h` without a compiled tree would drop the GPS sign fix, the download deadline and the `CCERTLIST` guard. Those stay on this snapshot until that tree can be built.

@@ -54,6 +54,7 @@
 #include <Preferences.h>
 #include <SPI.h>
 #include <SD.h>
+#include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
 #include <vector>
 
@@ -99,11 +100,22 @@ String subscribe_topic_prefix = "smartiotcr/parameters/v2/"; // Topic to subscri
 
 // API Gateway URLs
 const char *CHECK_FIRMWARE_UPDATE_URL = "https://junkzqt2yc.execute-api.us-east-1.amazonaws.com/pro/device_firmware_config";
-const char *CHECK_FIRMWARE_KEY = "";
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#include "secrets.example.h"
+#endif
+#ifndef CHECK_FIRMWARE_KEY
+#define CHECK_FIRMWARE_KEY ""
+#endif
+#ifndef FIRMWARE_UPDATE_KEY
+#define FIRMWARE_UPDATE_KEY ""
+#endif
+#ifndef CONFIGURATION_SERVER_KEY
+#define CONFIGURATION_SERVER_KEY ""
+#endif
 const char *BASE_FIRMWARE_UPDATE_URL = "https://alxv44fafe.execute-api.us-east-1.amazonaws.com/dev/";
-const char *FIRMWARE_UPDATE_KEY = "";
 const char *CONFIGURATION_SERVER_URL =  "https://irwouyd9p6.execute-api.us-east-1.amazonaws.com/pro/device_sensor_config"; // Configuration Server details
-const char *CONFIGURATION_SERVER_KEY = "";
 
 //Firmware Update Parameters
 #define DEFAULT_CHECK_FIRMWARE_UPDATE 86400000L // Check every 24 hours
@@ -534,6 +546,11 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
         reset_sensor();
     }
 
+    if (!parameters_payload["SEND_LOGS"].isNull()) {
+        preferences.begin("devcfg", false);
+        preferences.putBool("slogs", parameters_payload["SEND_LOGS"].as<bool>());
+        preferences.end();
+    }
     if (!parameters_payload["TTS_SEC"].isNull()) {
         TIME_TO_SLEEP_SEC = clamp_i32_to_u32(parameters_payload["TTS_SEC"].as<long>(), TTS_SEC_MIN, TTS_SEC_MAX);
     }
@@ -638,13 +655,50 @@ JsonDocument check_firmware_update(){
 
 
 // Firmware Update Function
+void ota_remember_slot() {
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    Preferences prefs;
+    if (!prefs.begin("otarol", false) || !running || !running->label) return;
+    prefs.putString("prev", running->label);
+    prefs.putUChar("tries", 0);
+    prefs.end();
+}
+
+void ota_note_boot() {
+    Preferences prefs;
+    if (!prefs.begin("otarol", false)) return;
+    uint8_t tries = prefs.getUChar("tries", 0);
+    String prev = prefs.getString("prev", "");
+    if (tries >= 3 && prev.length() > 0) {
+        const esp_partition_t* previous = esp_partition_find_first(
+            ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, prev.c_str());
+        const esp_partition_t* running = esp_ota_get_running_partition();
+        prefs.putUChar("tries", 0);
+        prefs.end();
+        if (previous && running && previous != running) {
+            esp_ota_set_boot_partition(previous);
+            ESP.restart();
+        }
+        return;
+    }
+    prefs.putUChar("tries", (uint8_t)(tries + 1));
+    prefs.end();
+}
+
+void ota_confirm_image() {
+    Preferences prefs;
+    if (!prefs.begin("otarol", false)) return;
+    prefs.putUChar("tries", 0);
+    prefs.end();
+}
+
 void firmware_update(const char *bucket_name, const char *file_name){
 
     // Initialize HTTPS
     comm.https_begin();
     local_logger("Getting firmware file. . .");
 
-    String final_url = BASE_FIRMWARE_UPDATE_URL;
+    String final_url = String("https://alxv44fafe.execute-api.us-east-1.amazonaws.com/") + API_STAGE + "/";
     final_url.concat(bucket_name);
     final_url.concat("/");
     final_url.concat(file_name);
@@ -661,6 +715,18 @@ void firmware_update(const char *bucket_name, const char *file_name){
     comm.https_add_header("X-API-Key", FIRMWARE_UPDATE_KEY);
     int httpCode = 0;
     httpCode = comm.https_get();
+    if (httpCode != 200 && strcmp(API_STAGE, "dev") != 0) {
+        comm.https_end();
+        comm.https_begin();
+        final_url = String("https://alxv44fafe.execute-api.us-east-1.amazonaws.com/dev/");
+        final_url.concat(bucket_name);
+        final_url.concat("/");
+        final_url.concat(file_name);
+        if (comm.https_set_url(final_url)) {
+            comm.https_add_header("X-API-Key", FIRMWARE_UPDATE_KEY);
+            httpCode = comm.https_get();
+        }
+    }
     if (httpCode != 200) {
         Serial.print("HTTP GET failed ! error code = "); 
         Serial.println(httpCode); 
@@ -702,7 +768,9 @@ void firmware_update(const char *bucket_name, const char *file_name){
         if (len > 0) {
             written = Update.write(buffer, len);
             if (written != len) {
-                Serial.println("Written only : " + String(written) + "/" + String(len));
+                Update.abort();
+                comm.https_end();
+                return;
             }
             total += written;
             int newProgress = (total * 100) / firmware_size;
@@ -725,6 +793,12 @@ void firmware_update(const char *bucket_name, const char *file_name){
         }
     }
 
+    if ((size_t)total != firmware_size) {
+        Update.abort();
+        comm.https_end();
+        return;
+    }
+    ota_remember_slot();
     if (!Update.end()) {
         Serial.println("Update not finished? Something went wrong!");
         Serial.println("Error Occurred. Error #: " + String(Update.getError()));
@@ -770,6 +844,16 @@ void check_for_firmware_update(bool force_check) {
         bool new_firmware_available = str_param_1.toInt();
         String bucket_name = update_parameters["BUCKET_NAME"];
         String file_name = update_parameters["FILE_NAME"];
+        String offered_variant = update_parameters["VARIANT"] | update_parameters["S3_CONFIG"]["VARIANT"] | "";
+        int offered_version = update_parameters["FIRMWARE_VERSION"] | update_parameters["S3_CONFIG"]["VERSION"] | 0;
+        if (offered_variant.length() > 0 && offered_variant != VARIANT_ID) {
+            local_logger("OTA rejected. Variant does not match this build.");
+            return;
+        }
+        if (offered_version > 0 && offered_version <= firmware_version) {
+            local_logger("OTA rejected. Version is not newer.");
+            return;
+        }
 
         if (new_firmware_available) {
             // Save the messages in RTC memory before
@@ -2215,11 +2299,22 @@ bool connect_uplink(bool show_status) {
     return false;
 }
 
+void maybe_upload_logs() {
+    if (active_power_mode != POWER_NORMAL) return;
+    bool send_logs = false;
+    preferences.begin("devcfg", true);
+    send_logs = preferences.getBool("slogs", false);
+    preferences.end();
+    if (!send_logs && !announce_power_mode) return;
+    local_logger("Log upload is armed. The backend must supply a pre-signed URL.");
+}
+
 void setup() {
     bool has_been_configured = true;
     init_watchdog();
     g_wake_start_ms = millis();
     rtc_persist_boot();
+    ota_note_boot();
     comm.setClient(&cell_client);
     if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {
         load_device_params();
@@ -2379,7 +2474,8 @@ void setup() {
         if (result) {
             readingCnt = 0;
             consecutive_upload_failures = 0;            
-            local_logger("¡Fase de transmisión completada con éxito!");            
+            local_logger("¡Fase de transmisión completada con éxito!");
+            ota_confirm_image();            
         } else {
             local_logger("Fallo en la transmisión. Los datos quedan seguros localmente.");
             feed_watchdog();
@@ -2407,6 +2503,7 @@ void setup() {
     rtc_panic_flag = 0;
     first_run = 0;
     rtc_persist_commit();
+    maybe_upload_logs();
     update_running_time(); 
     go_sleep();
 }

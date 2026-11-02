@@ -163,7 +163,7 @@ public:
                 authMethod = 0;
             }
 
-            thisModem().sendAT("+CSSLCFG=\"sslversion\",0,4");
+            thisModem().sendAT("+CSSLCFG=\"sslversion\",0,3");
             thisModem().waitResponse();
 
             thisModem().sendAT("+CMQTTSSLCFG=", clientIndex, ",", 0);
