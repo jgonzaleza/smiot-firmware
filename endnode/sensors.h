@@ -11,3 +11,5 @@ void clear_sensors_configuration();
 void prepare_async_sensors();
 String get_final_sensor_payload();
 String sensors_sample(bool* configured);
+// Scale saved from the config document's MEASURE_SCALES. 1 when that name has none.
+float sensor_measure_scale(const char* value_name);

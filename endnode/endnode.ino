@@ -1028,11 +1028,14 @@ void loop() {
 
 void apply_pack_power(const String& payload) {
     float volts = -1;
+    const char* names[] = {"pack_v", "voltage", "vbat", "V", "b_v_v"};
     const char* keys[] = {"\"pack_v\":", "\"voltage\":", "\"vbat\":", "\"V\":", "\"b_v_v\":"};
     for (int i = 0; i < 5 && volts < 0; i++) {
         int at = payload.indexOf(keys[i]);
         if (at < 0) continue;
-        volts = payload.substring(at + strlen(keys[i])).toFloat();
+        float raw = payload.substring(at + strlen(keys[i])).toFloat();
+        if (raw < 0) continue;
+        volts = raw * sensor_measure_scale(names[i]);
     }
     PowerInput in = {};
     in.pack_volts = volts;

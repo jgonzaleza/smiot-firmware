@@ -12,6 +12,7 @@
 #include "ota_guard.h"
 #include "csv_parse.h"
 #include "variant.h"
+#include <string.h>
 #include <Update.h>
 #include <esp_task_wdt.h>
 
@@ -166,6 +167,79 @@ String get_sensor_payload(String sensor_id, int baud_rate, int sensor_address, i
 
     return return_value;
 }
+
+static String measure_scales_text(JsonVariant scales) {
+    if (scales.isNull()) return String();
+    if (scales.is<const char*>()) return String(scales.as<const char*>());
+    if (scales.is<JsonObject>() || scales.is<JsonArray>()) {
+        String out;
+        serializeJson(scales, out);
+        return out;
+    }
+    return String();
+}
+
+static bool scale_from_rules(const char* value_name, const char* names_csv, const char* rules, float* out) {
+    if (!value_name || !value_name[0] || !rules || !rules[0] || !out) return false;
+    if (rules[0] == '{' || rules[0] == '[') {
+        JsonDocument doc;
+        if (deserializeJson(doc, rules)) return false;
+        JsonVariant v;
+        if (rules[0] == '{') {
+            v = doc[value_name];
+        } else {
+            char name_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
+            bool truncated = false;
+            int name_count = csv_parse_tokens(names_csv ? names_csv : "", name_tokens, CSV_MAX_TOKENS, &truncated);
+            JsonArray arr = doc.as<JsonArray>();
+            for (int i = 0; i < name_count && i < (int)arr.size(); i++) {
+                if (strcmp(name_tokens[i], value_name) == 0) {
+                    v = arr[i];
+                    break;
+                }
+            }
+        }
+        if (v.isNull()) return false;
+        float scale = v.is<JsonObject>() ? (v["scale"] | 1.0f) : v.as<float>();
+        if (!(scale > 0.0f)) return false;
+        *out = scale;
+        return true;
+    }
+    char name_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
+    char scale_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
+    bool names_truncated = false;
+    bool scales_truncated = false;
+    int name_count = csv_parse_tokens(names_csv ? names_csv : "", name_tokens, CSV_MAX_TOKENS, &names_truncated);
+    int scale_count = csv_parse_tokens(rules, scale_tokens, CSV_MAX_TOKENS, &scales_truncated);
+    int n = name_count < scale_count ? name_count : scale_count;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(name_tokens[i], value_name) != 0) continue;
+        float scale = String(scale_tokens[i]).toFloat();
+        if (!(scale > 0.0f)) return false;
+        *out = scale;
+        return true;
+    }
+    return false;
+}
+
+float sensor_measure_scale(const char* value_name) {
+    if (!value_name || !value_name[0]) return 1.0f;
+    for (int i = 0; i < namespaces_size; i++) {
+        preferences.begin(namespace_id[i].c_str(), true);
+        String names = preferences.getString("VALUE_NAMES", "");
+        String scales = preferences.getString("MEASURE_SCALES", "");
+        preferences.end();
+        float scale = 1.0f;
+        if (scale_from_rules(value_name, names.c_str(), scales.c_str(), &scale)) return scale;
+    }
+    preferences.begin("devcfg", true);
+    String device_scales = preferences.getString("MEASURE_SCALES", "");
+    preferences.end();
+    float scale = 1.0f;
+    if (scale_from_rules(value_name, "", device_scales.c_str(), &scale)) return scale;
+    return 1.0f;
+}
+
 bool get_sensor_configuration(bool show_status) {
 
     JsonDocument parameters_payload;
@@ -301,6 +375,7 @@ bool get_sensor_configuration(bool show_status) {
         int baud;
         String value_names;
         String value_types;
+        String measure_scales;
         bool has_types;
     };
 
@@ -324,6 +399,7 @@ bool get_sensor_configuration(bool show_status) {
         item.value_names = sensor_config["VALUE_NAMES"].as<String>();
         item.has_types = sensor_config["VALUE_TYPES"].is<String>();
         item.value_types = item.has_types ? sensor_config["VALUE_TYPES"].as<String>() : String("");
+        item.measure_scales = measure_scales_text(sensor_config["MEASURE_SCALES"]);
         item.trig_reg = sensor_config["TRIG_REG"] | 0;
         item.trig_val = sensor_config["TRIG_VAL"] | 1;
         item.stat_reg = sensor_config["STAT_REG"] | 1;
@@ -388,11 +464,20 @@ bool get_sensor_configuration(bool show_status) {
             preferences.putInt("BAUD_RATE", item.baud);
             preferences.putString("VALUE_NAMES", item.value_names);
             if (item.has_types) preferences.putString("VALUE_TYPES", item.value_types);
+            if (item.measure_scales.length() > 0) {
+                preferences.putString("MEASURE_SCALES", item.measure_scales);
+            }
         }
         preferences.end();
         feed_watchdog();
         if (show_status) blink_led(255, 255, 255, 500);
     }
+
+    String device_scales = measure_scales_text(parameters_payload["MEASURE_SCALES"]);
+    preferences.begin("devcfg", false);
+    if (device_scales.length() > 0) preferences.putString("MEASURE_SCALES", device_scales);
+    else if (preferences.isKey("MEASURE_SCALES")) preferences.remove("MEASURE_SCALES");
+    preferences.end();
 
     parameters_payload.clear();
     comm.https_end();
