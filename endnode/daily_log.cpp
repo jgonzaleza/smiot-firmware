@@ -12,7 +12,7 @@ RTC_DATA_ATTR DailyHealth g_daily_health = {
     -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1
 };
 
-RTC_DATA_ATTR int g_log_level = LOG_INFO;
+RTC_DATA_ATTR int smiot_log_level = LOG_INFO;
 
 static int32_t health_today() {
     uint32_t now = (uint32_t)get_current_timestamp();
@@ -54,20 +54,20 @@ void daily_log_note_voltage(float volts) {
 
 void daily_log_set_level_code(int level) {
     if (level < LOG_ERROR || level > LOG_DEBUG) return;
-    g_log_level = level;
+    smiot_log_level = level;
 }
 
 void daily_log_set_level_text(const char* text) {
     int level = parse_log_level(text, -1);
     if (level < 0) return;
-    g_log_level = level;
+    smiot_log_level = level;
     preferences.begin("devcfg", false);
-    preferences.putUChar("loglvl", (uint8_t)g_log_level);
+    preferences.putUChar("loglvl", (uint8_t)smiot_log_level);
     preferences.end();
 }
 
 int daily_log_level() {
-    return g_log_level;
+    return smiot_log_level;
 }
 
 static int rtc_queue_records() {
@@ -169,7 +169,7 @@ void write_daily_wake_log() {
     bool warn = active_power_mode == POWER_LOW || (last_rssi >= 0 && last_rssi < 8);
     uint32_t elapsed = 0;
     if (g_wake_start_ms > 0 && millis() >= g_wake_start_ms) elapsed = (millis() - g_wake_start_ms) / 1000UL;
-    if (!wake_log_enabled(g_log_level, error, warn)) {
+    if (!wake_log_enabled(smiot_log_level, error, warn)) {
         health_add_awake(&g_daily_health, elapsed);
         return;
     }
@@ -180,7 +180,7 @@ void write_daily_wake_log() {
 
     WakeLogFields fields;
     memset(&fields, 0, sizeof(fields));
-    fields.level = g_log_level;
+    fields.level = smiot_log_level;
     fields.unix_time = (uint32_t)get_current_timestamp();
     fields.sim = sim_label.c_str();
     fields.iccid = sim_iccid.c_str();
