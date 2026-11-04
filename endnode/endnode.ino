@@ -38,6 +38,7 @@
 #include "queue_manager.h"
 #include "csv_parse.h"
 #include "param_limits.h"
+#include "param_flags.h"
 #include "power_policy.h"
 #include "sketch_config.h"
 #include "variant.h"
@@ -451,6 +452,17 @@ void load_device_params() {
     rtc_persist_commit();
 }
 
+// JSON true, or any non-zero number. as<bool>() is not enough: ArduinoJson 7
+// returns false for the 1 the backend sends.
+static bool command_flag_on(JsonVariant value) {
+    if (value.isNull()) return false;
+    const bool is_bool = value.is<bool>();
+    const bool is_number = !is_bool && !value.is<const char*>() && !value.is<JsonObject>() && !value.is<JsonArray>();
+    const bool bool_value = is_bool && value.as<bool>();
+    const long number = is_number ? value.as<long>() : 0L;
+    return flag_is_on(true, is_bool, bool_value, is_number, number);
+}
+
 // MQTT Callback to receive parameters
 void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len) {
 
@@ -473,7 +485,7 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
     uint32_t hash = payload_hash32(payload, len);
     bool restart_requested = false;
     uint32_t restart_id = 0;
-    if (!parameters_payload["RESTART"].isNull() && parameters_payload["RESTART"].as<bool>()) {
+    if (command_flag_on(parameters_payload["RESTART"])) {
         if (!parameters_payload["RESTART_ID"].isNull()) {
             restart_id = parameters_payload["RESTART_ID"].as<uint32_t>();
         }
@@ -481,16 +493,16 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
         if (restart_id != g_rtc.last_restart_id) restart_requested = true;
     }
 
+    JsonVariant rr_value = parameters_payload["RR_SENSOR"];
+    const bool rr_on = command_flag_on(rr_value);
+    const bool pulse_rain = rain_pulse_due(rr_on, g_rtc.rr_prev != 0);
+
     // Retained messages (60 s) are delivered again on the next connect.
-    // Skip them when neither the body nor the restart id is new.
-    if (hash == g_rtc.param_hash && !restart_requested) {
+    // Skip them when the body and the restart id are unchanged and the rain
+    // command is not a rising edge. A repeated 1 stays quiet; 0 then 1 pulses.
+    if (hash == g_rtc.param_hash && !restart_requested && !pulse_rain) {
         parameters_payload.clear();
         return;
-    }
-
-    if (!parameters_payload["RR_SENSOR"].isNull() && parameters_payload["RR_SENSOR"].as<bool>()) {
-        local_logger("Reset rain sensor command received");
-        reset_sensor();
     }
 
     if (!parameters_payload["SEND_LOGS"].isNull()) {
@@ -521,7 +533,7 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
         READING_RATE = clamp_i32_to_u32(parameters_payload["R_RATE"].as<long>(), R_RATE_MIN, R_RATE_MAX);
     }
     if (!parameters_payload["G_GPS_DATA"].isNull()) {
-        get_gps_data = parameters_payload["G_GPS_DATA"].as<bool>();
+        get_gps_data = command_flag_on(parameters_payload["G_GPS_DATA"]);
     }
     if (!parameters_payload["C_F_UPDATE"].isNull()) {
         long check_ms = parameters_payload["C_F_UPDATE"].as<long>();
@@ -538,11 +550,22 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
         if (lon >= -180.0f && lon <= 180.0f) local_lon2 = lon;
     }
 
-    if (hash != g_rtc.param_hash || restart_requested) {
+    const uint8_t rr_next = rr_value.isNull() ? g_rtc.rr_prev : (uint8_t)(rr_on ? 1 : 0);
+    const bool rr_changed = g_rtc.rr_prev != rr_next;
+    g_rtc.rr_prev = rr_next;
+
+    if (hash != g_rtc.param_hash || restart_requested || rr_changed) {
         g_rtc.param_hash = hash;
         if (restart_requested) g_rtc.last_restart_id = restart_id;
         save_device_params();
         rtc_persist_commit();
+    }
+
+    // Pulse while this callback is still awake. Sleep later holds GPIO46 low,
+    // so the 5 s HIGH must finish before get_mqtt_parameters returns.
+    if (pulse_rain) {
+        local_logger("Reset rain sensor command received");
+        reset_sensor();
     }
 
     parameters_payload.clear();

@@ -2,6 +2,7 @@
 #include "daily_log.h"
 #include "network_policy.h"
 #include "ota_verify.h"
+#include "param_flags.h"
 #include "power_policy.h"
 #include "queue_pool.h"
 #include "sketch_config.h"
@@ -321,6 +322,30 @@ static void test_daily_log_and_health() {
     expect(strchr(line, '\n') == NULL, "wake line is one record");
 }
 
+static void test_rain_command_rising_edge() {
+    const bool one = flag_is_on(true, false, false, true, 1);
+    const bool json_true = flag_is_on(true, true, true, false, 0);
+    const bool zero = flag_is_on(true, false, false, true, 0);
+    const bool json_false = flag_is_on(true, true, false, false, 0);
+
+    expect(one, "number 1 is a command");
+    expect(json_true, "JSON true is a command");
+    expect(rain_pulse_due(one, false), "1 pulses when previous is off");
+    expect(rain_pulse_due(json_true, false), "true pulses when previous is off");
+
+    expect(!zero, "number 0 is not a command");
+    expect(!json_false, "JSON false is not a command");
+    expect(!rain_pulse_due(zero, false), "0 does not pulse");
+    expect(!rain_pulse_due(json_false, false), "false does not pulse");
+
+    bool previous_on = false;
+    expect(rain_pulse_due(one, previous_on), "first 1 pulses");
+    previous_on = true;
+    expect(!rain_pulse_due(one, previous_on), "repeated 1 does not pulse");
+    previous_on = zero;
+    expect(rain_pulse_due(one, previous_on), "1 after a 0 pulses again");
+}
+
 static void test_missing_signature_rejects_ota() {
     const char* sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const char* other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
@@ -351,6 +376,7 @@ int main() {
     test_rotation_skips_local_sim();
     test_rotation_sticky_expiry_returns_to_automatic();
     test_cops_numeric_plmn();
+    test_rain_command_rising_edge();
     test_missing_signature_rejects_ota();
     test_daily_log_and_health();
     if (failures) {
