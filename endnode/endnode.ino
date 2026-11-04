@@ -1028,8 +1028,8 @@ void loop() {
 
 void apply_pack_power(const String& payload) {
     float volts = -1;
-    const char* keys[] = {"\"pack_v\":", "\"voltage\":", "\"vbat\":", "\"V\":"};
-    for (int i = 0; i < 4 && volts < 0; i++) {
+    const char* keys[] = {"\"pack_v\":", "\"voltage\":", "\"vbat\":", "\"V\":", "\"b_v_v\":"};
+    for (int i = 0; i < 5 && volts < 0; i++) {
         int at = payload.indexOf(keys[i]);
         if (at < 0) continue;
         volts = payload.substring(at + strlen(keys[i])).toFloat();
