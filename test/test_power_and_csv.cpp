@@ -1,5 +1,6 @@
 #include "csv_parse.h"
 #include "network_policy.h"
+#include "ota_verify.h"
 #include "power_policy.h"
 #include "queue_pool.h"
 #include "sketch_config.h"
@@ -247,6 +248,18 @@ static void test_cops_numeric_plmn() {
     expect(strcmp(SIM_PREFIXES, "89464:hologram,89883:emnify") == 0, "build default prefix table");
 }
 
+static void test_missing_signature_rejects_ota() {
+    const char* sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const char* other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    expect(ota_precheck(NULL, "AAAA", sha) == OTA_PRECHECK_REJECT_MISSING, "missing hash rejects");
+    expect(ota_precheck("", "AAAA", sha) == OTA_PRECHECK_REJECT_MISSING, "empty hash rejects");
+    expect(ota_precheck(sha, NULL, sha) == OTA_PRECHECK_REJECT_MISSING, "missing signature rejects");
+    expect(ota_precheck(sha, "", sha) == OTA_PRECHECK_REJECT_MISSING, "empty signature rejects");
+    expect(ota_precheck(sha, "AAAA", other) == OTA_PRECHECK_REJECT_HASH, "hash mismatch rejects");
+    expect(ota_precheck("abcd", "AAAA", sha) == OTA_PRECHECK_REJECT_HASH, "short hash rejects");
+    // A present signature is not acceptance. ECDSA stays on the device.
+}
+
 int main() {
     test_csv_keeps_last_token();
     test_csv_bounds();
@@ -265,6 +278,7 @@ int main() {
     test_rotation_skips_local_sim();
     test_rotation_sticky_expiry_returns_to_automatic();
     test_cops_numeric_plmn();
+    test_missing_signature_rejects_ota();
     if (failures) {
         printf("%d failed\n", failures);
         return 1;

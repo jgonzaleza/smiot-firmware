@@ -133,7 +133,9 @@ RTC_DATA_ATTR unsigned long firmware_running_time;
 int active_device_type = DEFAULT_DEVICE_TYPE;
 //Firmware version defined in platformio.ini, should be updated with every firmware change to allow for proper OTA updates
 const int firmware_version = FIRMWARE_VERSION;
-#include "ota_guard.h" 
+#include "ota_guard.h"
+#include "ota_verify.h"
+#include <mbedtls/sha256.h> 
 
 // Timing (Seconds)
 #define uS_TO_S_FACTOR 1000000ULL
@@ -595,8 +597,14 @@ JsonDocument check_firmware_update(){
 }
 
 
-// Firmware Update Function
-void firmware_update(const char *bucket_name, const char *file_name){
+// S3_CONFIG.SHA256 is lowercase hex of the image. S3_CONFIG.SIGNATURE is base64 DER ECDSA P-256.
+// Unsigned images are rejected. The signature is checked before Update.end().
+void firmware_update(const char *bucket_name, const char *file_name, const char* sha256_hex, const char* signature_b64){
+    if (!sha256_hex || !sha256_hex[0] || !signature_b64 || !signature_b64[0]) {
+        local_logger("OTA rejected. S3_CONFIG.SHA256 (hex) and S3_CONFIG.SIGNATURE (base64) are required. Unsigned images are not installed.");
+        add_sensor_error("[OTA_UNSIGNED]");
+        return;
+    }
 
     // Initialize HTTPS
     comm.https_begin();
@@ -655,6 +663,7 @@ void firmware_update(const char *bucket_name, const char *file_name){
     Serial.println("Start upgrade firmware ...");
     if (!Update.begin(firmware_size)) {
         Serial.println("Not enough space to begin OTA");
+        comm.https_end();
         return;
     }
 
@@ -662,6 +671,10 @@ void firmware_update(const char *bucket_name, const char *file_name){
     int written = 0;
     int progress = 0;
     int total = 0;
+    bool sha_ok = false;
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    sha_ok = mbedtls_sha256_starts_ret(&sha, 0) == 0;
 
     uint32_t update_timeout_start = millis();    
 
@@ -672,10 +685,12 @@ void firmware_update(const char *bucket_name, const char *file_name){
         if (len > 0) {
             written = Update.write(buffer, len);
             if (written != len) {
+                mbedtls_sha256_free(&sha);
                 Update.abort();
                 comm.https_end();
                 return;
             }
+            if (!sha_ok || mbedtls_sha256_update_ret(&sha, buffer, (size_t)written) != 0) sha_ok = false;
             total += written;
             int newProgress = (total * 100) / firmware_size;
             
@@ -697,7 +712,34 @@ void firmware_update(const char *bucket_name, const char *file_name){
         }
     }
 
-    if ((size_t)total != firmware_size) {
+    uint8_t image_hash[32];
+    memset(image_hash, 0, sizeof(image_hash));
+    if (sha_ok) sha_ok = mbedtls_sha256_finish_ret(&sha, image_hash) == 0;
+    mbedtls_sha256_free(&sha);
+
+    if ((size_t)total != firmware_size || !sha_ok) {
+        local_logger("OTA rejected. Download was incomplete or the SHA-256 could not be computed.");
+        Update.abort();
+        comm.https_end();
+        return;
+    }
+    char actual_hex[65];
+    sha256_to_hex(image_hash, actual_hex);
+    OtaPrecheck offer = ota_precheck(sha256_hex, signature_b64, actual_hex);
+    if (offer != OTA_PRECHECK_NEED_SIGNATURE) {
+        if (offer == OTA_PRECHECK_REJECT_MISSING) {
+            local_logger("OTA rejected. SHA256 or SIGNATURE is missing. Unsigned images are not installed.");
+            add_sensor_error("[OTA_UNSIGNED]");
+        } else {
+            local_logger("OTA rejected. SHA256 does not match the downloaded image.");
+            add_sensor_error("[OTA_BAD_HASH]");
+        }
+        Update.abort();
+        comm.https_end();
+        return;
+    }
+    if (!ota_signature_valid(image_hash, signature_b64)) {
+        add_sensor_error("[OTA_BAD_SIGNATURE]");
         Update.abort();
         comm.https_end();
         return;
@@ -706,6 +748,7 @@ void firmware_update(const char *bucket_name, const char *file_name){
     if (!Update.end()) {
         Serial.println("Update not finished? Something went wrong!");
         Serial.println("Error Occurred. Error #: " + String(Update.getError()));
+        comm.https_end();
         return;
     }
 
@@ -760,6 +803,15 @@ void check_for_firmware_update(bool force_check) {
         }
 
         if (new_firmware_available) {
+            String offered_sha = update_parameters["S3_CONFIG"]["SHA256"] | "";
+            String offered_sig = update_parameters["S3_CONFIG"]["SIGNATURE"] | "";
+            offered_sha.trim();
+            offered_sig.trim();
+            if (offered_sha.length() == 0 || offered_sig.length() == 0) {
+                local_logger("OTA rejected. S3_CONFIG.SHA256 (hex) and S3_CONFIG.SIGNATURE (base64) are required. Unsigned images are not installed.");
+                add_sensor_error("[OTA_UNSIGNED]");
+                return;
+            }
             // Save the messages in RTC memory before
             spillover_rtc_to_sd();
             delay(500); // Give some time for the spillover to complete before starting the update process
@@ -768,7 +820,7 @@ void check_for_firmware_update(bool force_check) {
             local_logger("Trying to Update . . .");
             local_logger(bucket_name);
             local_logger(file_name);
-            firmware_update(bucket_name.c_str(), file_name.c_str());
+            firmware_update(bucket_name.c_str(), file_name.c_str(), offered_sha.c_str(), offered_sig.c_str());
         } else {
             local_logger("NO New Firmware!");
         }

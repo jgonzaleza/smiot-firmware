@@ -45,14 +45,16 @@ An OTA image whose variant does not match the running build is rejected. A versi
 
 ## OTA
 
-Sign an image with a P-256 key that stays outside Git:
+The device rejects an update that does not include `S3_CONFIG.SHA256` (lowercase hex of the image) and `S3_CONFIG.SIGNATURE` (base64 DER ECDSA P-256 over those bytes). It checks both before `Update.end()`.
+
+Sign an image with a P-256 key that stays outside Git. The script needs the `cryptography` package (`python3 -m pip install cryptography`):
 
 ```bash
 openssl ecparam -name prime256v1 -genkey -noout -out firmware-signing-key.pem
-python3 tools/sign_firmware.py --key firmware-signing-key.pem --image .pio/build/endnode_cell/firmware.bin
+python3 scripts/sign_firmware.py --key firmware-signing-key.pem --image .pio/build/endnode_cell/firmware.bin
 ```
 
-Put the matching public key in `endnode/certs/FirmwareUpdatePublicKey.h` before you require signatures. The private key must not be committed.
+Put the matching public key in `endnode/certs/FirmwareUpdatePublicKey.h`. The private key must not be committed. Copy the printed `SHA256` and `SIGNATURE` into the OTA config.
 
 The OTA URL uses the `prod` stage and falls back to `dev` when the first GET is not 200.
 
