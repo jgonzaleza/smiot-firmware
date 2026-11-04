@@ -11,12 +11,47 @@
 #include "csv_parse.h"
 #include "network_policy.h"
 #include "variant.h"
+#include <string.h>
 #include <ModbusMaster.h>
 #include <ArduinoJson.h>
 #include <Update.h>
 #include <esp_task_wdt.h>
 
 static const uint8_t CELL_RETRY_EVERY = 6;
+
+static RotationState rotation_state() {
+    RotationState state;
+    memset(&state, 0, sizeof(state));
+    state.index = current_network_index;
+    state.failures = consecutive_network_changes;
+    state.max_failures = MAX_NETWORK_FAILURES;
+    state.slot_count = 4;
+    state.local_sim = (global_apn == "local_carrier");
+    state.sticky_since = net_sticky_since;
+    return state;
+}
+
+static void store_rotation(const RotationState& state) {
+    current_network_index = state.index;
+    consecutive_network_changes = state.failures;
+    if (state.sticky_since == net_sticky_since) return;
+    net_sticky_since = state.sticky_since;
+    preferences.begin("devcfg", false);
+    preferences.putUInt("nstk", net_sticky_since);
+    preferences.end();
+}
+
+void note_uplink_success() {
+    RotationState state = rotation_state();
+    rotation_on_success(&state, (uint32_t)get_current_timestamp());
+    store_rotation(state);
+}
+
+void note_uplink_failure() {
+    RotationState state = rotation_state();
+    rotation_on_failure(&state);
+    store_rotation(state);
+}
 
 static void capture_registered_plmn() {
     // Ask for the numeric operator, then read it. Format 2 does not change the selected network.
@@ -184,41 +219,43 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
         }
     #endif
 
-    // ==========================================================
-    // NUEVA LÓGICA DE ROTACIÓN DE RED (ANTI-ZOMBIE)
-    // ==========================================================
-    if (consecutive_network_changes >= MAX_NETWORK_FAILURES) {
-        current_network_index++; // Try next network option
-        if (current_network_index > 3) {
-            current_network_index = 0; // Back to automatic mode after trying all options
-        }
-        // Reset the counter after a network change to give it a fresh start
-        consecutive_network_changes = 0; 
-        local_logger("Max failures reached. Switching network to index: ", current_network_index);
+    // Carrier rotation. Automatic is index 0. A backend "local" SIM stays on +COPS=0.
+    RotationState rotation = rotation_state();
+    int rotation_before = rotation.index;
+    uint32_t sticky_sec = (uint32_t)NET_STICKY_HOURS * 3600UL;
+    rotation_prepare(&rotation, (uint32_t)get_current_timestamp(), sticky_sec);
+    if (rotation.index != rotation_before) {
+        local_logger("Max failures reached or sticky carrier expired. Switching network to index: ", rotation.index);
     }
+    store_rotation(rotation);
 
-    if (current_network_index == 0 || global_apn == "local_carrier") {
+    String forced_plmn = "";
+    if (!rotation.local_sim && rotation.index > 0 && rotation.index < 4) {
+        forced_plmn = plmn_table[rotation.index];
+        forced_plmn.trim();
+    }
+    if (rotation.local_sim || rotation.index == 0 || forced_plmn.length() == 0 || forced_plmn == "AUTO") {
         local_logger("Network set to automatic (+COPS=0)");
-        modem.sendAT(GF("+COPS=0")); // Automatic mode
+        modem.sendAT(GF("+COPS=0"));
         modem.waitResponse(10000L, at_response);
         local_logger("Automatic registration: ", at_response);
     } else {
-        String plmn = plmn_table[current_network_index];
-        if (plmn.length() == 0) plmn = "AUTO";
-        local_logger("Forcing manual network (+COPS=1,2): ", plmn);
-        
-        // A. Forzamos el desregistro primero (Limpiar caché de la red zombie)
+        local_logger("Forcing manual network (+COPS=1,2): ", forced_plmn);
+        // Deregister first so a stuck cell is not reused.
         modem.sendAT(GF("+COPS=2"));
         modem.waitResponse(5000L, at_response);
         local_logger("Forced deregister: ", at_response);
-        
-        // B. Intentamos el registro manual usando el código PLMN
-        modem.sendAT(GF("+COPS=1,2,\""), plmn, GF("\",7"));
-        // C. Importante: La búsqueda manual toma tiempo. Le damos hasta 30 segundos.
-        modem.waitResponse(30000L, at_response); 
+        // Manual search can take a while. Allow 30 seconds, LTE (access technology 7) first.
+        modem.sendAT(GF("+COPS=1,2,\""), forced_plmn, GF("\",7"));
+        int registration = modem.waitResponse(30000L, at_response);
         local_logger("Manual registration: ", at_response);
+        if (registration != 1) {
+            local_logger("Manual registration with access technology 7 failed. Retrying the same PLMN without it.");
+            modem.sendAT(GF("+COPS=1,2,\""), forced_plmn, GF("\""));
+            modem.waitResponse(30000L, at_response);
+            local_logger("Manual registration retry: ", at_response);
+        }
     }
-    // ==========================================================
 
     // Check network registration status and network signal status
     int16_t sq ;
@@ -415,14 +452,18 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
         blink_led(255, 0, 0, 10000);
     } 
 
-    #ifdef DEBUG
-        // MODO DEBUG: Forzamos la rotación de red en cada reinicio/ejecución
-        current_network_index++;
-        if (current_network_index > 3) {
-            current_network_index = 0;
-        }
-        local_logger("DEBUG MODE: Forzando cambio manual de red a indice: ", current_network_index);        
-    #endif
+#ifdef DEBUG_FORCE_ROTATION
+    current_network_index++;
+    if (current_network_index > 3) current_network_index = 0;
+    consecutive_network_changes = 0;
+    if (net_sticky_since != 0) {
+        net_sticky_since = 0;
+        preferences.begin("devcfg", false);
+        preferences.putUInt("nstk", 0);
+        preferences.end();
+    }
+    local_logger("DEBUG_FORCE_ROTATION: manual network index is now ", current_network_index);
+#endif
 
 
     return result;    

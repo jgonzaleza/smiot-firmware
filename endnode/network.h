@@ -9,3 +9,5 @@ void use_cell_client();
 bool use_wifi_client();
 #endif
 bool connect_uplink(bool show_status = false);
+void note_uplink_success();
+void note_uplink_failure();

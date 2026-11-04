@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
 static int failures = 0;
 
@@ -176,6 +177,68 @@ static void test_backend_local_sets_no_apn() {
     expect(strcmp(mixed.sim, "local") == 0, "trimmed LOCAL");
 }
 
+static RotationState test_rotation(int index, int failures, bool local, uint32_t sticky) {
+    RotationState state;
+    memset(&state, 0, sizeof(state));
+    state.index = index;
+    state.failures = failures;
+    state.max_failures = 3;
+    state.slot_count = 4;
+    state.local_sim = local;
+    state.sticky_since = sticky;
+    return state;
+}
+
+static void test_rotation_advances_after_three_failures() {
+    RotationState state = test_rotation(0, 3, false, 0);
+    rotation_prepare(&state, 1, 86400);
+    expect(state.index == 1, "three failures advance to the first PLMN");
+    expect(state.failures == 0, "failure count resets after a rotation");
+}
+
+static void test_rotation_resets_on_success() {
+    RotationState state = test_rotation(2, 2, false, 0);
+    rotation_on_success(&state, 5000);
+    expect(state.failures == 0, "success clears consecutive failures");
+    expect(state.index == 2, "success keeps the current carrier");
+    expect(state.sticky_since == 5000, "manual success starts the sticky timer");
+
+    RotationState automatic = test_rotation(0, 2, false, 0);
+    rotation_on_success(&automatic, 5000);
+    expect(automatic.failures == 0, "automatic success clears failures");
+    expect(automatic.sticky_since == 0, "automatic success does not start sticky");
+}
+
+static void test_rotation_wraps_to_automatic() {
+    RotationState state = test_rotation(3, 3, false, 0);
+    rotation_prepare(&state, 1, 86400);
+    expect(state.index == 0, "last PLMN wraps back to automatic");
+    expect(state.failures == 0, "wrap resets the failure count");
+}
+
+static void test_rotation_skips_local_sim() {
+    RotationState state = test_rotation(2, 3, true, 100);
+    rotation_on_failure(&state);
+    expect(state.failures == 3, "local SIM does not count another failure");
+    rotation_prepare(&state, 1, 86400);
+    expect(state.index == 0, "local SIM is forced to automatic");
+    expect(state.sticky_since == 0, "local SIM clears the sticky carrier");
+    expect(state.failures == 0, "local SIM does not keep a rotation debt");
+}
+
+static void test_rotation_sticky_expiry_returns_to_automatic() {
+    const uint32_t sticky_sec = (uint32_t)NET_STICKY_HOURS * 3600u;
+    RotationState stay = test_rotation(2, 0, false, 1000);
+    rotation_prepare(&stay, 1000 + sticky_sec - 1, sticky_sec);
+    expect(stay.index == 2, "sticky carrier is kept until the window ends");
+
+    RotationState expired = test_rotation(2, 0, false, 1000);
+    rotation_prepare(&expired, 1000 + sticky_sec, sticky_sec);
+    expect(expired.index == 0, "sticky expiry returns to automatic");
+    expect(expired.sticky_since == 0, "sticky timestamp is cleared");
+    expect(NET_STICKY_HOURS == 24, "default sticky window is 24 hours");
+}
+
 static void test_cops_numeric_plmn() {
     char plmn[8];
     expect(cops_numeric_plmn("\r\n+COPS: 0,2,\"71204\",7\r\nOK\r\n", plmn, sizeof(plmn)), "cops parsed");
@@ -196,6 +259,11 @@ int main() {
     test_unknown_iccid_uses_default_apn();
     test_backend_apn_overrides_prefix();
     test_backend_local_sets_no_apn();
+    test_rotation_advances_after_three_failures();
+    test_rotation_resets_on_success();
+    test_rotation_wraps_to_automatic();
+    test_rotation_skips_local_sim();
+    test_rotation_sticky_expiry_returns_to_automatic();
     test_cops_numeric_plmn();
     if (failures) {
         printf("%d failed\n", failures);

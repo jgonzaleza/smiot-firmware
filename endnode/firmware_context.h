@@ -62,6 +62,7 @@ extern String sim_label;
 extern String sim_iccid;
 extern String registered_plmn;
 extern bool sim_unknown_reported;
+extern uint32_t net_sticky_since;
 extern const char* broker;
 extern const uint16_t broker_port;
 extern const char* client_id_prefix;

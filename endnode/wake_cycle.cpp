@@ -124,13 +124,14 @@ void deliver_sample(WakeState& wake) {
         if (sent) {
             readingCnt = 0;
             consecutive_upload_failures = 0;
+            note_uplink_success();
             local_logger("Transmit phase completed.");
             ota_confirm_image();
         } else {
             local_logger("Transmit failed. The readings stay stored locally.");
             feed_watchdog();
             consecutive_upload_failures++;
-            consecutive_network_changes++;
+            note_uplink_failure();
             if (consecutive_upload_failures >= 3) radio_skip_remaining = 3;
             if (consecutive_upload_failures >= MAX_CONSECUTIVE_FAILURES) {
                 local_logger("Too many consecutive send failures. Restarting.");

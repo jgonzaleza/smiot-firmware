@@ -83,6 +83,7 @@ String sim_label = "";
 String sim_iccid = "";
 String registered_plmn = "";
 RTC_DATA_ATTR bool sim_unknown_reported = false;
+RTC_DATA_ATTR uint32_t net_sticky_since = 0;
 char plmn_table[4][8] = {"AUTO", "71203", "71204", "71201"};
 long timezone_offset_sec = -21600;
 #define MAX_CONSECUTIVE_FAILURES 12 // Max number of consecutive failures before giving up and restarting
@@ -408,6 +409,9 @@ void load_device_params() {
     if (preferences.isKey("apn")) {
         configured_apn = preferences.getString("apn", "");
         configured_apn_set = true;
+    }
+    if (net_sticky_since == 0 && preferences.isKey("nstk")) {
+        net_sticky_since = preferences.getUInt("nstk", 0);
     }
     if (!preferences.isKey("phash")) {
         preferences.end();

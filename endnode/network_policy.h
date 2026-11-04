@@ -178,6 +178,60 @@ inline ApnChoice choose_apn(const char* modem_reply, const char* backend_apn, co
     return out;
 }
 
+// Carrier rotation. Index 0 is automatic. A local SIM never leaves automatic.
+// After a successful send on a manual carrier, stay there until sticky_sec elapses.
+
+struct RotationState {
+    int index;
+    int failures;
+    int max_failures;
+    int slot_count;
+    bool local_sim;
+    uint32_t sticky_since;
+};
+
+inline void rotation_on_failure(RotationState* state) {
+    if (!state || state->local_sim) return;
+    if (state->failures < 1000000) state->failures++;
+}
+
+inline void rotation_on_success(RotationState* state, uint32_t now) {
+    if (!state) return;
+    state->failures = 0;
+    if (state->local_sim) {
+        state->index = 0;
+        state->sticky_since = 0;
+        return;
+    }
+    if (state->index > 0 && state->sticky_since == 0 && now > 0) state->sticky_since = now;
+}
+
+// Call at the start of registration. Expiry back to automatic wins over a failure advance.
+inline void rotation_prepare(RotationState* state, uint32_t now, uint32_t sticky_sec) {
+    if (!state) return;
+    if (state->slot_count < 2) state->slot_count = 4;
+    if (state->max_failures < 1) state->max_failures = 3;
+    if (state->local_sim) {
+        state->index = 0;
+        state->failures = 0;
+        state->sticky_since = 0;
+        return;
+    }
+    if (state->index > 0 && state->sticky_since > 0 && now > state->sticky_since && sticky_sec > 0 &&
+        (now - state->sticky_since) >= sticky_sec) {
+        state->index = 0;
+        state->failures = 0;
+        state->sticky_since = 0;
+        return;
+    }
+    if (state->failures >= state->max_failures) {
+        state->index++;
+        if (state->index < 0 || state->index >= state->slot_count) state->index = 0;
+        state->failures = 0;
+        state->sticky_since = 0;
+    }
+}
+
 // Numeric operator from AT+COPS? after AT+COPS=3,2. Example: +COPS: 0,2,"71204",7
 inline bool cops_numeric_plmn(const char* response, char* out, size_t out_len) {
     if (!out || out_len == 0) return false;
