@@ -33,6 +33,12 @@ void boot_start(WakeState& wake) {
     Serial.begin(115200);
     Serial.println(ESP.getEfuseMac());
     gpio_hold_dis((gpio_num_t)PIN_5V_EN);
+    gpio_hold_dis((gpio_num_t)RS485_EN_PIN);
+    gpio_hold_dis((gpio_num_t)RESET_RAIN_SENSOR_PIN);
+    gpio_hold_dis((gpio_num_t)BOARD_SD_CS_PIN);
+#ifdef MODEM_RESET_PIN
+    gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
+#endif
     gpio_deep_sleep_hold_dis();
     pinMode(PIN_5V_EN, OUTPUT);
     digitalWrite(PIN_5V_EN, HIGH);
