@@ -4,6 +4,7 @@
 #include "network.h"
 #include "sensors.h"
 #include "gps_module.h"
+#include "gps_policy.h"
 #include "power_policy.h"
 #include "queue_manager.h"
 #include "time_manager.h"
@@ -139,11 +140,15 @@ String get_gps_payload(bool show_status) {
         Serial.println("CHECK_FIRMWARE_UPDATE: ");
         Serial.println(CHECK_FIRMWARE_UPDATE);
     #endif
-    if (gps_running_time >= CHECK_GPS_UPDATE) {
-        gps_running_time = 0;
-        local_logger("Checking GPS Position");
-        gps_payload = get_gps_position(show_status);
-    } else if(!get_gps_data && gps_fix_ok(local_lat2, local_lon2)) {
+    // gps_sample passes first_boot as show_status. That flag still blinks the
+    // LED, and on this path it also forces a GNSS read when the modem is on.
+    GpsSampleInput sample = {};
+    sample.first_boot = show_status;
+    sample.modem_ready = true;
+    sample.get_gps_data = get_gps_data;
+    sample.cache_ok = gps_fix_ok(local_lat2, local_lon2);
+    sample.update_due = gps_running_time >= CHECK_GPS_UPDATE;
+    if (decide_gps_sample(sample) == GPS_CACHE) {
         gps_payload = "{\"lat\":";
         gps_payload += String(local_lat2, 5);
         gps_payload.concat(", \"lon\":");
@@ -154,9 +159,11 @@ String get_gps_payload(bool show_status) {
         local_logger("GPS Data from Cache!");
         local_logger(gps_payload);
     } else {
-        local_logger("Checking GPS Position");
+        if (sample.update_due) gps_running_time = 0;
+        if (sample.first_boot) local_logger("First boot. Checking GPS position.");
+        else local_logger("Checking GPS Position");
         gps_payload = get_gps_position(show_status);
-    }    
+    }
     return gps_payload;
 }
 bool gps_fix_ok(float lat, float lon) {
@@ -172,7 +179,13 @@ String gps_sample(bool modem_ready, bool first_boot) {
         feed_watchdog();
         return gps_payload;
     }
-    if (gps_fix_ok(local_lat2, local_lon2)) {
+    GpsSampleInput sample = {};
+    sample.first_boot = first_boot;
+    sample.modem_ready = false;
+    sample.get_gps_data = get_gps_data;
+    sample.cache_ok = gps_fix_ok(local_lat2, local_lon2);
+    sample.update_due = gps_running_time >= CHECK_GPS_UPDATE;
+    if (decide_gps_sample(sample) == GPS_CACHE) {
         return "{\"lat\":" + String(local_lat2, 5) + ",\"lon\":" + String(local_lon2, 5) + ",\"src\":\"Cache\"}";
     }
     return "{\"src\":\"Skipped\"}";

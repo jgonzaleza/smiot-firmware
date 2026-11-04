@@ -1,5 +1,6 @@
 #include "csv_parse.h"
 #include "daily_log.h"
+#include "gps_policy.h"
 #include "network_policy.h"
 #include "ota_verify.h"
 #include "param_flags.h"
@@ -346,6 +347,31 @@ static void test_rain_command_rising_edge() {
     expect(rain_pulse_due(one, previous_on), "1 after a 0 pulses again");
 }
 
+static GpsSampleInput gps_sample_input(bool first_boot, bool modem_ready, bool get_gps_data, bool cache_ok, bool update_due) {
+    GpsSampleInput in = {};
+    in.first_boot = first_boot;
+    in.modem_ready = modem_ready;
+    in.get_gps_data = get_gps_data;
+    in.cache_ok = cache_ok;
+    in.update_due = update_due;
+    return in;
+}
+
+static void test_first_boot_takes_a_gps_fix() {
+    expect(decide_gps_sample(gps_sample_input(true, true, false, true, false)) == GPS_TRY,
+           "first boot with the modem on tries a fix");
+    expect(decide_gps_sample(gps_sample_input(false, true, false, true, false)) == GPS_CACHE,
+           "later wake with gps off and a valid cache stays on cache");
+    expect(decide_gps_sample(gps_sample_input(false, true, false, true, true)) == GPS_TRY,
+           "a due gps interval still tries a fix");
+    expect(decide_gps_sample(gps_sample_input(false, true, true, true, false)) == GPS_TRY,
+           "gps requested still tries a fix");
+    expect(decide_gps_sample(gps_sample_input(true, false, false, true, false)) == GPS_CACHE,
+           "first boot without the modem uses the cache");
+    expect(decide_gps_sample(gps_sample_input(false, false, false, false, false)) == GPS_SKIP,
+           "no modem and no cache is skipped");
+}
+
 static void test_missing_signature_rejects_ota() {
     const char* sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const char* other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
@@ -377,6 +403,7 @@ int main() {
     test_rotation_sticky_expiry_returns_to_automatic();
     test_cops_numeric_plmn();
     test_rain_command_rising_edge();
+    test_first_boot_takes_a_gps_fix();
     test_missing_signature_rejects_ota();
     test_daily_log_and_health();
     if (failures) {
