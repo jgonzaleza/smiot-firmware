@@ -77,13 +77,12 @@
 
 // ================= CONSTANTS & CONFIG ================= //
 
-// Network
-#define DEFAULT_NETWORK_APN "hologram" // Default APN
-const char *hologram_apn = "hologram"; 
-const char *hologram_id = "89464";
-const char *emnify_apn = "emnify";
-const char *emnify_id = "89883";
+// Network. DEFAULT_NETWORK_APN and SIM_PREFIXES live in sketch_config.h.
 String global_apn = DEFAULT_NETWORK_APN;
+String sim_label = "";
+String sim_iccid = "";
+String registered_plmn = "";
+RTC_DATA_ATTR bool sim_unknown_reported = false;
 char plmn_table[4][8] = {"AUTO", "71203", "71204", "71201"};
 long timezone_offset_sec = -21600;
 #define MAX_CONSECUTIVE_FAILURES 12 // Max number of consecutive failures before giving up and restarting
@@ -201,6 +200,7 @@ uint8_t active_power_mode = POWER_NORMAL;
 bool announce_power_mode = false;
 int max_backlog_batches = 2;
 String configured_apn = "";
+bool configured_apn_set = false;
 RTC_DATA_ATTR uint8_t radio_skip_remaining = 0;
 RTC_DATA_ATTR uint8_t gps_fail_streak = 0;
 RTC_DATA_ATTR int saved_power_mode = POWER_NORMAL;
@@ -405,6 +405,10 @@ void save_device_params() {
 
 void load_device_params() {
     if (!preferences.begin("devcfg", true)) return;
+    if (preferences.isKey("apn")) {
+        configured_apn = preferences.getString("apn", "");
+        configured_apn_set = true;
+    }
     if (!preferences.isKey("phash")) {
         preferences.end();
         return;
@@ -908,7 +912,8 @@ String get_final_payload(String sensors_payload, String gps_payload, bool result
     doc["fv"] = firmware_version;
     doc["uid"] = String(ESP.getEfuseMac());
     doc["dt"] = String(active_device_type);
-    doc["net"] = global_apn;
+    doc["net"] = registered_plmn;
+    doc["sim"] = sim_label;
     doc["ts"] = (int)current_time_source;
     doc["tm"] = final_timestamp;
     doc["eff_sleep"] = active_sleep_sec;

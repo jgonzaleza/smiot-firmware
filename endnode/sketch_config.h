@@ -1,6 +1,12 @@
 #pragma once
 
 #define DEFAULT_NETWORK_APN "hologram"
+#ifndef SIM_PREFIXES
+#define SIM_PREFIXES "89464:hologram,89883:emnify"
+#endif
+#ifndef NET_STICKY_HOURS
+#define NET_STICKY_HOURS 24
+#endif
 #define MAX_CONSECUTIVE_FAILURES 12
 #define MAX_NETWORK_FAILURES 3
 #define DEFAULT_CHECK_FIRMWARE_UPDATE 86400000L

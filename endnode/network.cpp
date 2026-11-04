@@ -9,6 +9,7 @@
 #include "time_manager.h"
 #include "ota_guard.h"
 #include "csv_parse.h"
+#include "network_policy.h"
 #include "variant.h"
 #include <ModbusMaster.h>
 #include <ArduinoJson.h>
@@ -16,6 +17,19 @@
 #include <esp_task_wdt.h>
 
 static const uint8_t CELL_RETRY_EVERY = 6;
+
+static void capture_registered_plmn() {
+    // Ask for the numeric operator, then read it. Format 2 does not change the selected network.
+    modem.sendAT(GF("+COPS=3,2"));
+    modem.waitResponse(3000);
+    String response;
+    modem.sendAT(GF("+COPS?"));
+    if (modem.waitResponse(5000L, response) != 1) return;
+    char plmn[8];
+    if (!cops_numeric_plmn(response.c_str(), plmn, sizeof(plmn))) return;
+    registered_plmn = plmn;
+    local_logger("Registered PLMN: ", registered_plmn);
+}
 
 void init_modem() {
     Serial.begin(115200); // Set console baud rate
@@ -132,53 +146,42 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
     }
    
     String at_response;
-    //Set APN for Global SIMs
+    // Backend APN, then ICCID prefix, then DEFAULT_NETWORK_APN. local only if the backend says so.
     #ifdef DEFAULT_NETWORK_APN
         local_logger("Detecting SIM type via ICCID...");
-        
-        String iccid = modem.getSimCCID();
-        bool requires_apn = false; 
-        
-        if (iccid.length() > 10) { 
-            local_logger("ICCID: ", iccid);
-            
-            if (iccid.startsWith("89464")) {
-                global_apn = String(hologram_apn); 
-                requires_apn = true;
-                local_logger("SIM Detected: Hologram");
-            } 
-            else if (iccid.startsWith("89883")) {
-                global_apn = String(emnify_apn);
-                requires_apn = true;
-                local_logger("SIM Detected: Emnify");
-            } 
-            else {
-                global_apn = "local_carrier"; // Mark it for the backend
-                requires_apn = false;
-                local_logger("SIM Detected: Local Carrier");
-            }
-
-            // Only set the PDP Context if the SIM explicitly needs it
-            if (requires_apn) {
-                local_logger("Setting network APN to: ", global_apn);
-                modem.sendAT(GF("+CGDCONT=1,\"IP\",\""), global_apn, "\"");
-                
-                if (modem.waitResponse() != 1) {
-                    local_logger("Error: Failed to set APN context!");
-                    if (show_status) {
-                        blink_led(255, 0, 0, 10000);
-                    }                
-                }            
-            } else {
-                local_logger("Skipping manual APN configuration.");
-            }
-            
+        String iccid = cell_client.getSimCCID();
+        const char* backend_apn = configured_apn_set ? configured_apn.c_str() : NULL;
+        ApnChoice choice = choose_apn(iccid.c_str(), backend_apn, SIM_PREFIXES, DEFAULT_NETWORK_APN);
+        sim_iccid = choice.iccid;
+        sim_label = choice.sim;
+        if (choice.iccid[0]) {
+            local_logger("ICCID: ", choice.iccid);
+            local_logger("SIM Detected: ", sim_log_name(choice.sim));
         } else {
             local_logger("Error: Failed to read ICCID or SIM missing.");
-            if (show_status) {
-                blink_led(255, 0, 0, 10000);
+            if (show_status) blink_led(255, 0, 0, 10000);
+        }
+        if (choice.unknown_iccid) {
+            if (!sim_unknown_reported) {
+                local_logger("SIM prefix is unknown. Using the default APN.");
+                add_sensor_error("[SIM_UNKNOWN_ICCID]");
+                sim_unknown_reported = true;
             }
-        } 
+        } else {
+            sim_unknown_reported = false;
+        }
+        if (choice.set_apn) {
+            global_apn = choice.apn;
+            local_logger("Setting network APN to: ", global_apn);
+            modem.sendAT(GF("+CGDCONT=1,\"IP\",\""), global_apn, "\"");
+            if (modem.waitResponse() != 1) {
+                local_logger("Error: Failed to set APN context!");
+                if (show_status) blink_led(255, 0, 0, 10000);
+            }
+        } else {
+            global_apn = "local_carrier";
+            local_logger("Skipping manual APN configuration.");
+        }
     #endif
 
     // ==========================================================
@@ -288,6 +291,7 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
     }
 
     local_logger("Registration Status: ", status);
+    if (status == REG_OK_HOME || status == REG_OK_ROAMING) capture_registered_plmn();
     if (show_status) {
         blink_led(0, 255, 0);
     }                

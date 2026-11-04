@@ -345,6 +345,31 @@ bool get_sensor_configuration(bool show_status) {
         }
         preferences.end();
     }
+    if (!config_error) {
+        bool saw_apn = false;
+        String apn_value;
+        if (!parameters_payload["APN"].isNull()) {
+            apn_value = parameters_payload["APN"].as<String>();
+            saw_apn = true;
+        } else if (!parameters_payload["COUNTRY"].isNull()) {
+            JsonObject country = parameters_payload["COUNTRY"].as<JsonObject>();
+            if (!country["APN"].isNull()) {
+                apn_value = country["APN"].as<String>();
+                saw_apn = true;
+            }
+        }
+        if (saw_apn) {
+            apn_value.trim();
+            if (apn_value.length() == 0 || apn_value.equalsIgnoreCase("local")) apn_value = "local";
+            if (apn_value.length() > 31) apn_value = apn_value.substring(0, 31);
+            configured_apn = apn_value;
+            configured_apn_set = true;
+            preferences.begin("devcfg", false);
+            preferences.putString("apn", configured_apn);
+            preferences.end();
+            local_logger("Backend APN saved: ", configured_apn);
+        }
+    }
     if (show_status) {
         blink_led(255,255,255,500);
     }

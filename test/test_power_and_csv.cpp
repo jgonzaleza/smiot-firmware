@@ -1,6 +1,8 @@
 #include "csv_parse.h"
+#include "network_policy.h"
 #include "power_policy.h"
 #include "queue_pool.h"
+#include "sketch_config.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -124,6 +126,64 @@ static void test_queue_pool_drops_oldest_and_rejects_oversize() {
     expect(strcmp(tight, "abcd\n") == 0, "tight pool unchanged");
 }
 
+static void test_hologram_iccid_strips_prefix() {
+    const char* table = "89464:hologram,89883:emnify";
+    ApnChoice choice = choose_apn("+ICCID: 89464278206109010629", NULL, table, DEFAULT_NETWORK_APN);
+    expect(strcmp(choice.iccid, "89464278206109010629") == 0, "iccid digits only");
+    expect(choice.set_apn, "hologram sets an APN");
+    expect(strcmp(choice.apn, "hologram") == 0, "hologram apn");
+    expect(strcmp(choice.sim, "hologram") == 0, "hologram sim");
+    expect(!choice.unknown_iccid, "known prefix is not an error");
+    expect(strcmp(sim_log_name(choice.sim), "Hologram") == 0, "log name Hologram");
+
+    ApnChoice emnify = choose_apn("+ICCID: 89883000000000000000", NULL, table, DEFAULT_NETWORK_APN);
+    expect(strcmp(emnify.sim, "emnify") == 0, "emnify prefix");
+    expect(strcmp(emnify.apn, "emnify") == 0, "emnify apn");
+}
+
+static void test_unknown_iccid_uses_default_apn() {
+    const char* table = "89464:hologram,89883:emnify";
+    ApnChoice choice = choose_apn("+ICCID: 89148000000000000000", NULL, table, DEFAULT_NETWORK_APN);
+    expect(choice.unknown_iccid, "unknown prefix records an error");
+    expect(choice.set_apn, "unknown prefix still sets the default APN");
+    expect(strcmp(choice.apn, "hologram") == 0, "default apn is hologram");
+    expect(strcmp(choice.sim, "unknown") == 0, "unknown sim label");
+    expect(strcmp(choice.sim, "local") != 0, "unknown is not local");
+}
+
+static void test_backend_apn_overrides_prefix() {
+    const char* table = "89464:hologram,89883:emnify";
+    ApnChoice choice = choose_apn("+ICCID: 89464278206109010629", "internet", table, DEFAULT_NETWORK_APN);
+    expect(choice.set_apn, "backend apn is applied");
+    expect(strcmp(choice.apn, "internet") == 0, "backend apn overrides the prefix");
+    expect(strcmp(choice.sim, "hologram") == 0, "sim stays the prefix carrier");
+    expect(!choice.unknown_iccid, "backend apn suppresses the unknown error");
+}
+
+static void test_backend_local_sets_no_apn() {
+    const char* table = "89464:hologram,89883:emnify";
+    ApnChoice local = choose_apn("+ICCID: 89464278206109010629", "local", table, DEFAULT_NETWORK_APN);
+    expect(!local.set_apn, "local sets no APN");
+    expect(strcmp(local.sim, "local") == 0, "local sim");
+    expect(!local.unknown_iccid, "local is not an unknown-sim error");
+
+    ApnChoice empty = choose_apn("+ICCID: 89464278206109010629", "", table, DEFAULT_NETWORK_APN);
+    expect(!empty.set_apn, "empty backend APN sets no APN");
+    expect(strcmp(empty.sim, "local") == 0, "empty backend APN is local");
+
+    ApnChoice mixed = choose_apn("  +ICCID: 89464278206109010629  ", " LOCAL ", table, DEFAULT_NETWORK_APN);
+    expect(!mixed.set_apn, "LOCAL is case insensitive");
+    expect(strcmp(mixed.sim, "local") == 0, "trimmed LOCAL");
+}
+
+static void test_cops_numeric_plmn() {
+    char plmn[8];
+    expect(cops_numeric_plmn("\r\n+COPS: 0,2,\"71204\",7\r\nOK\r\n", plmn, sizeof(plmn)), "cops parsed");
+    expect(strcmp(plmn, "71204") == 0, "plmn 71204");
+    expect(!cops_numeric_plmn("+COPS: 0,0,\"Kolbi\",7", plmn, sizeof(plmn)), "name is not a plmn");
+    expect(strcmp(SIM_PREFIXES, "89464:hologram,89883:emnify") == 0, "build default prefix table");
+}
+
 int main() {
     test_csv_keeps_last_token();
     test_csv_bounds();
@@ -132,6 +192,11 @@ int main() {
     test_pack_volts_from_raw_count();
     test_missing_pack_keeps_backend();
     test_queue_pool_drops_oldest_and_rejects_oversize();
+    test_hologram_iccid_strips_prefix();
+    test_unknown_iccid_uses_default_apn();
+    test_backend_apn_overrides_prefix();
+    test_backend_local_sets_no_apn();
+    test_cops_numeric_plmn();
     if (failures) {
         printf("%d failed\n", failures);
         return 1;
