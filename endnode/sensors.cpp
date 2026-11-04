@@ -11,6 +11,7 @@
 #include "time_manager.h"
 #include "ota_guard.h"
 #include "csv_parse.h"
+#include "daily_log.h"
 #include "variant.h"
 #include <string.h>
 #include <Update.h>
@@ -368,6 +369,10 @@ bool get_sensor_configuration(bool show_status) {
             preferences.putString("apn", configured_apn);
             preferences.end();
             local_logger("Backend APN saved: ", configured_apn);
+        }
+        if (!parameters_payload["LOG_LEVEL"].isNull()) {
+            String level = parameters_payload["LOG_LEVEL"].as<String>();
+            daily_log_set_level_text(level.c_str());
         }
     }
     if (show_status) {

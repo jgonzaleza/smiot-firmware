@@ -208,6 +208,7 @@ RTC_DATA_ATTR uint8_t radio_skip_remaining = 0;
 RTC_DATA_ATTR uint8_t gps_fail_streak = 0;
 RTC_DATA_ATTR int saved_power_mode = POWER_NORMAL;
 float last_pack_volts = -1;
+int last_rssi = -1;
 
 // Global Flags
 bool reset_rain_sensor = false; //Flag to reset rain sensor
@@ -415,6 +416,9 @@ void load_device_params() {
     if (net_sticky_since == 0 && preferences.isKey("nstk")) {
         net_sticky_since = preferences.getUInt("nstk", 0);
     }
+    if (preferences.isKey("loglvl")) {
+        daily_log_set_level_code(preferences.getUChar("loglvl", LOG_INFO));
+    }
     if (!preferences.isKey("phash")) {
         preferences.end();
         return;
@@ -493,6 +497,10 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
         preferences.begin("devcfg", false);
         preferences.putBool("slogs", parameters_payload["SEND_LOGS"].as<bool>());
         preferences.end();
+    }
+    if (!parameters_payload["LOG_LEVEL"].isNull()) {
+        String level = parameters_payload["LOG_LEVEL"].as<String>();
+        daily_log_set_level_text(level.c_str());
     }
     if (!parameters_payload["TTS_SEC"].isNull()) {
         TIME_TO_SLEEP_SEC = clamp_i32_to_u32(parameters_payload["TTS_SEC"].as<long>(), TTS_SEC_MIN, TTS_SEC_MAX);
@@ -941,6 +949,8 @@ void go_sleep(){
 
 // Get Final Sensor Payload
 
+void attach_daily_health(JsonDocument& doc);
+
 // Get Final Payload
 String get_final_payload(String sensors_payload, String gps_payload, bool result) {
 
@@ -1002,7 +1012,7 @@ String get_final_payload(String sensors_payload, String gps_payload, bool result
         doc["rst_err"] = reset_errors;
         rtc_error_ring_clear();
     }
-    // ==========================================
+    attach_daily_health(doc);
 
     serializeJson(doc, final_payload);
 
@@ -1149,6 +1159,7 @@ void apply_pack_power(const String& payload) {
     announce_power_mode = decision.changed;
     saved_power_mode = decision.mode;
     last_pack_volts = pv.valid ? pv.volts : -1;
+    if (pv.valid) daily_log_note_voltage(pv.volts);
     if (!pv.valid) {
         local_logger("Pack voltage missing or failed. Keeping the backend interval.");
         add_sensor_error("[PACK_V_MISSING]");

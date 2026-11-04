@@ -12,6 +12,7 @@
 #include "utilities.h"
 #include "rtc_persist.h"
 #include "param_limits.h"
+#include "daily_log.h"
 
 
 // 5 Minutes. If the board gets stuck for 5 mins without "feeding", it restarts.
@@ -39,6 +40,7 @@ inline void add_sd_error(String msg) {
         strcat(rtc_sd_error_log, msg.c_str());
     }
     rtc_error_ring_push(msg.c_str());
+    daily_log_note_sd_error();
 }
 
 // Return the current SD card diagnostic log and clear it from RTC

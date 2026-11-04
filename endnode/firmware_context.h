@@ -53,6 +53,7 @@ extern uint8_t radio_skip_remaining;
 extern uint8_t gps_fail_streak;
 extern int saved_power_mode;
 extern float last_pack_volts;
+extern int last_rssi;
 extern int active_device_type;
 extern const int firmware_version;
 extern char plmn_table[4][8];

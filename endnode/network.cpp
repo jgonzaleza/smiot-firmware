@@ -450,7 +450,10 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
     
     if (!result && show_status){
         blink_led(255, 0, 0, 10000);
-    } 
+    }
+
+    int16_t sq_now = modem.getSignalQuality();
+    if (sq_now >= 0 && sq_now <= 99) last_rssi = sq_now; 
 
 #ifdef DEBUG_FORCE_ROTATION
     current_network_index++;

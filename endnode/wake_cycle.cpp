@@ -8,6 +8,7 @@
 #include "time_manager.h"
 #include "ota_guard.h"
 #include "queue_manager.h"
+#include "daily_log.h"
 #include <ArduinoJson.h>
 
 static void sync_clock() {
@@ -26,6 +27,7 @@ void boot_start(WakeState& wake) {
     g_wake_start_ms = millis();
     rtc_persist_boot();
     ota_note_boot();
+    daily_log_boot((int)esp_reset_reason());
     comm.setClient(&cell_client);
     if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {
         load_device_params();
@@ -132,6 +134,7 @@ void deliver_sample(WakeState& wake) {
             feed_watchdog();
             consecutive_upload_failures++;
             note_uplink_failure();
+            daily_log_note_net_fail();
             if (consecutive_upload_failures >= 3) radio_skip_remaining = 3;
             if (consecutive_upload_failures >= MAX_CONSECUTIVE_FAILURES) {
                 local_logger("Too many consecutive send failures. Restarting.");
@@ -150,6 +153,7 @@ void sleep_now() {
     rtc_panic_flag = 0;
     first_run = 0;
     rtc_persist_commit();
+    write_daily_wake_log();
     maybe_upload_logs();
     update_running_time();
     go_sleep();

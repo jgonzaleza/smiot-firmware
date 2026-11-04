@@ -9,6 +9,7 @@
 #include "time_manager.h"
 #include "ota_guard.h"
 #include "csv_parse.h"
+#include "daily_log.h"
 #include "variant.h"
 #include <Update.h>
 #include <esp_task_wdt.h>
@@ -104,6 +105,7 @@ String get_gps_position(bool show_status) {
             blink_led(0,255,0);
         }
     } else {
+        daily_log_note_gps_fail();
         //If we don't get GPS data in the correct range, we decide to use a fix value
         get_gps_data = false;
         if (!get_gps_data && gps_fix_ok(local_lat2, local_lon2)) {

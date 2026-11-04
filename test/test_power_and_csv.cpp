@@ -1,4 +1,5 @@
 #include "csv_parse.h"
+#include "daily_log.h"
 #include "network_policy.h"
 #include "ota_verify.h"
 #include "power_policy.h"
@@ -248,6 +249,78 @@ static void test_cops_numeric_plmn() {
     expect(strcmp(SIM_PREFIXES, "89464:hologram,89883:emnify") == 0, "build default prefix table");
 }
 
+static DailyHealth test_health() {
+    DailyHealth health;
+    memset(&health, 0, sizeof(health));
+    health.day = -1;
+    health.sent_day = -1;
+    health.vmin_centi = -1;
+    health.vmax_centi = -1;
+    return health;
+}
+
+static void test_daily_log_and_health() {
+    expect(parse_log_level("INFO", LOG_ERROR) == LOG_INFO, "info level");
+    expect(parse_log_level("error", LOG_INFO) == LOG_ERROR, "error level");
+    expect(parse_log_level("nope", LOG_INFO) == LOG_INFO, "unknown level keeps the default");
+    expect(wake_log_enabled(LOG_INFO, false, false), "info writes every wake");
+    expect(!wake_log_enabled(LOG_ERROR, false, false), "error stays quiet without an error");
+    expect(wake_log_enabled(LOG_ERROR, true, false), "error writes when something failed");
+    expect(wake_log_enabled(LOG_WARN, false, true), "warn writes on a warning");
+
+    expect(local_day_number(0, 0) == 0, "epoch is day 0");
+    char ymd[9];
+    format_log_day(0, ymd);
+    expect(strcmp(ymd, "19700101") == 0, "day 0 is 1970-01-01");
+    expect(day_from_ymd(1970, 1, 1) == 0, "ymd converts back");
+    format_log_day(20000, ymd);
+    int32_t round = -1;
+    char named[16];
+    snprintf(named, sizeof(named), "%s.log", ymd);
+    expect(log_name_to_day(named, &round), "log name parses");
+    expect(round == 20000, "log name round trip");
+    expect(!log_file_expired(10, 16), "six days ago is kept");
+    expect(log_file_expired(10, 17), "seven days ago is removed");
+
+    DailyHealth health = test_health();
+    health_count_reset(&health, 8);
+    expect(health.wdt == 0 && health.rst_other == 0, "deep sleep is not a reset");
+    health_count_reset(&health, 6);
+    expect(health.wdt == 1 && health.rst_wdt == 1, "task watchdog is counted");
+    health_count_reset(&health, 4);
+    expect(health.rst_panic == 1, "panic is counted by cause");
+    health.net_fail = 2;
+    health_ensure_day(&health, 5);
+    expect(health.day == 5 && health.net_fail == 2, "first dated day keeps early counters");
+    health_ensure_day(&health, 6);
+    expect(health.day == 6 && health.net_fail == 0, "a new day clears counters");
+    expect(!health_due(&health, 6, false), "low or critical power skips the summary");
+    expect(health_due(&health, 6, true), "first normal transmit of the day is due");
+    health.sent_day = 6;
+    expect(!health_due(&health, 6, true), "a later transmit the same day is not due");
+
+    WakeLogFields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.level = LOG_INFO;
+    fields.unix_time = 1710000000UL;
+    fields.sim = "hologram";
+    fields.iccid = "89464278206109010629";
+    fields.plmn = "71204";
+    fields.carrier_index = 0;
+    fields.rssi = 18;
+    fields.vmin_centi = 1190;
+    fields.vmax_centi = 1240;
+    fields.sd_present = 1;
+    fields.queue_depth = 2;
+    fields.awake_sec = 40;
+    char line[192];
+    expect(format_wake_log(&fields, line, sizeof(line)) > 0, "wake line fits");
+    expect(line[0] == 'I', "info line starts with I");
+    expect(strstr(line, "89464278206109010629") != NULL, "wake line has the cleaned iccid");
+    expect(strstr(line, "71204") != NULL, "wake line has the plmn");
+    expect(strchr(line, '\n') == NULL, "wake line is one record");
+}
+
 static void test_missing_signature_rejects_ota() {
     const char* sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const char* other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
@@ -279,6 +352,7 @@ int main() {
     test_rotation_sticky_expiry_returns_to_automatic();
     test_cops_numeric_plmn();
     test_missing_signature_rejects_ota();
+    test_daily_log_and_health();
     if (failures) {
         printf("%d failed\n", failures);
         return 1;
