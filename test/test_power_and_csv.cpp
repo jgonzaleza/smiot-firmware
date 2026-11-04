@@ -357,6 +357,23 @@ static GpsSampleInput gps_sample_input(bool first_boot, bool modem_ready, bool g
     return in;
 }
 
+static void test_gps_time_budget() {
+    expect(GPS_COLD_BUDGET_SEC == 90, "cold budget default is 90 s");
+    expect(GPS_WARM_BUDGET_SEC == 30, "warm budget default is 30 s");
+    expect(GPS_FAIL_BUDGET_SEC == 15, "short budget default is 15 s");
+    expect(GPS_POLL_MS == 2000, "gps poll default is 2000 ms");
+    expect(gps_budget_sec(true, true, 0) == 90, "first boot uses 90 s");
+    expect(gps_budget_sec(true, false, 0) == 90, "first boot without a cache uses 90 s");
+    expect(gps_budget_sec(false, true, 0) == 30, "warm start with a cache uses 30 s");
+    expect(gps_budget_sec(false, true, 2) == 30, "two misses still use the warm budget");
+    expect(gps_budget_sec(false, false, 0) == 90, "no cache uses 90 s");
+    expect(gps_budget_sec(false, true, 3) == 15, "three misses use 15 s");
+    expect(gps_budget_sec(true, false, 4) == 15, "a failure streak uses 15 s on first boot");
+    expect(gps_budget_sec(false, false, 255) == 15, "a full streak stays on 15 s");
+    // A fix in get_gps_position sets gps_fail_streak back to 0. A timeout
+    // increments it and stops at 255. That write stays next to the modem loop.
+}
+
 static void test_first_boot_takes_a_gps_fix() {
     expect(decide_gps_sample(gps_sample_input(true, true, false, true, false)) == GPS_TRY,
            "first boot with the modem on tries a fix");
@@ -404,6 +421,7 @@ int main() {
     test_cops_numeric_plmn();
     test_rain_command_rising_edge();
     test_first_boot_takes_a_gps_fix();
+    test_gps_time_budget();
     test_missing_signature_rejects_ota();
     test_daily_log_and_health();
     if (failures) {

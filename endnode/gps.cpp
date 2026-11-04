@@ -37,6 +37,7 @@ String get_gps_position(bool show_status) {
     
     local_logger("Enabling GPS/GNSS/GLONASS");
     bool got_gps_data = false;
+    bool accepted = false;
     int i = 10;
     bool enabled_gps = false;
     while (!enabled_gps && (i > 0)) {
@@ -57,39 +58,56 @@ String get_gps_position(bool show_status) {
     } else {
         local_logger("GPS Enabled");
         modem.setGPSBaud(115200);
-        int attempts = 15;
-        if (gps_fail_streak >= 3) attempts = 5;
-        i = attempts;
-        while (i > 0) {
-            local_logger("Requesting current GPS/GNSS/GLONASS location");
+        // gps_sample() passes first_boot as show_status. The cache and the
+        // failure streak are the same live values decide_gps_sample() uses.
+        const bool first_boot = show_status;
+        const bool cache_ok = gps_fix_ok(local_lat2, local_lon2);
+        const uint32_t budget_sec = gps_budget_sec(first_boot, cache_ok, gps_fail_streak);
+        if (gps_fail_streak >= 3) {
+            local_logger("GPS short start, budget", budget_sec, "s");
+        } else if (first_boot || !cache_ok) {
+            local_logger("GPS cold start, budget", budget_sec, "s");
+        } else {
+            local_logger("GPS warm start, budget", budget_sec, "s");
+        }
+        const unsigned long budget_ms = (unsigned long)budget_sec * 1000UL;
+        const unsigned long started = millis();
+        while ((millis() - started) < budget_ms) {
+            feed_watchdog();
+            const unsigned long poll_at = millis();
             got_gps_data = modem.getGPS(&fixMode, &lat2, &lon2, &speed2, &alt2, &vsat2, &usat2, &accuracy2,
-                            &year2, &month2, &day2, &hour2, &min2, &sec2);                
-            if (got_gps_data) {
+                            &year2, &month2, &day2, &hour2, &min2, &sec2);
+            if (got_gps_data && (fixMode == 2 || fixMode == 3) && gps_fix_ok(lat2, lon2)) {
+                accepted = true;
                 gps_payload = "{";
-                gps_payload.concat("\"lat\":"); 
+                gps_payload.concat("\"lat\":");
                 gps_payload += String(lat2, 5);
                 gps_payload.concat(",");
-                gps_payload.concat("\"lon\":");                 
+                gps_payload.concat("\"lon\":");
                 gps_payload += String(lon2, 5);
                 gps_payload.concat(",");
-                gps_payload.concat("\"src\":"); 
+                gps_payload.concat("\"src\":");
                 gps_payload.concat("\"GPS\"");
-                gps_payload.concat("}");                
+                gps_payload.concat("}");
                 break;
-            } else {
-                local_logger("Couldn't get GPS/GNSS/GLONASS location, retrying in 1s.: ", i);
-                i--;
-                if (show_status) {
-                    blink_led(0,0,255);
-                } else {
-                    delay(1000);
-                }                
             }
-        }            
-    }    
+            const unsigned long elapsed_ms = millis() - started;
+            if (elapsed_ms >= budget_ms) break;
+            unsigned long wait_ms = (unsigned long)GPS_POLL_MS;
+            const unsigned long spent = millis() - poll_at;
+            if (spent >= wait_ms) wait_ms = 0;
+            else wait_ms = wait_ms - spent;
+            const unsigned long remain = budget_ms - elapsed_ms;
+            if (wait_ms > remain) wait_ms = remain;
+            if (wait_ms > 0) delay(wait_ms);
+        }
+        const uint32_t elapsed_sec = (uint32_t)((millis() - started) / 1000UL);
+        if (accepted) local_logger("GPS fix in", elapsed_sec, "s");
+        else local_logger("GPS timeout after", elapsed_sec, "s");
+    }
     Serial.println("DISABLE GPS . . .");
     modem.disableGPS();
-    if (gps_fix_ok(lat2, lon2)){
+    if (accepted){
         gps_fail_streak = 0;
         //Si los datos están en los rangos normales para Costa Rica ya no los buscamos más.            
         #ifdef DEBUG
@@ -102,10 +120,12 @@ String get_gps_position(bool show_status) {
         get_gps_data = false;
         local_lat2 = lat2;
         local_lon2 = lon2;
+        local_logger(gps_payload);
         if (show_status) {
             blink_led(0,255,0);
         }
     } else {
+        if (enabled_gps && gps_fail_streak < 255) gps_fail_streak++;
         daily_log_note_gps_fail();
         //If we don't get GPS data in the correct range, we decide to use a fix value
         get_gps_data = false;

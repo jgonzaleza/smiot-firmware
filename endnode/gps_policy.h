@@ -1,5 +1,9 @@
 #pragma once
 
+#include <stdint.h>
+
+#include "sketch_config.h"
+
 // Whether this wake reads the GNSS receiver or reuses a stored fix.
 // No Arduino types. gps_sample() applies the result.
 //
@@ -32,4 +36,12 @@ inline GpsSampleChoice decide_gps_sample(const GpsSampleInput& in) {
     if (in.update_due) return GPS_TRY;
     if (!in.get_gps_data && in.cache_ok) return GPS_CACHE;
     return GPS_TRY;
+}
+
+// How long this wake may poll AT+CGNSSINFO. A streak of misses is shorter
+// than a cold start, and a cold start is longer than a warm check.
+inline uint32_t gps_budget_sec(bool first_boot, bool cache_ok, uint8_t fail_streak) {
+    if (fail_streak >= 3) return (uint32_t)GPS_FAIL_BUDGET_SEC;
+    if (first_boot || !cache_ok) return (uint32_t)GPS_COLD_BUDGET_SEC;
+    return (uint32_t)GPS_WARM_BUDGET_SEC;
 }

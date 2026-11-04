@@ -30,3 +30,15 @@
 #ifndef PACK_V_SCALE
 #define PACK_V_SCALE 0.01f
 #endif
+#ifndef GPS_COLD_BUDGET_SEC
+#define GPS_COLD_BUDGET_SEC 90
+#endif
+#ifndef GPS_WARM_BUDGET_SEC
+#define GPS_WARM_BUDGET_SEC 30
+#endif
+#ifndef GPS_FAIL_BUDGET_SEC
+#define GPS_FAIL_BUDGET_SEC 15
+#endif
+#ifndef GPS_POLL_MS
+#define GPS_POLL_MS 2000
+#endif
