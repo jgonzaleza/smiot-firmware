@@ -65,6 +65,31 @@ static void test_low_has_hysteresis() {
     expect(decide_power(leave).mode == POWER_NORMAL, "leave low at 11.4");
 }
 
+static void test_pack_volts_from_raw_count() {
+    PackVolts pv = pack_volts_from_raw(1199.0f, 0.01f);
+    expect(pv.valid, "1199 * 0.01 is a valid pack voltage");
+    float delta = pv.volts - 11.99f;
+    if (delta < 0.0f) delta = -delta;
+    expect(delta < 0.001f, "1199 * 0.01 is 11.99 V");
+
+    PowerInput in = {};
+    in.pack_volts = pv.volts;
+    in.pack_valid = pv.valid;
+    in.previous = POWER_NORMAL;
+    in.backend_sleep_sec = 510;
+    in.backend_reading_count = 1;
+    expect(decide_power(in).mode == POWER_NORMAL, "11.99 V stays POWER_NORMAL");
+
+    PackVolts zero = pack_volts_from_raw(0.0f, 0.01f);
+    expect(!zero.valid, "raw 0 is not a pack voltage");
+
+    PackVolts unscaled = pack_volts_from_raw(1199.0f, 1.0f);
+    expect(!unscaled.valid, "1199 * 1.0 is out of range");
+
+    PackVolts negative = pack_volts_from_raw(-1199.0f, 0.01f);
+    expect(!negative.valid, "negative raw stays invalid");
+}
+
 static void test_missing_pack_keeps_backend() {
     PowerInput in = {};
     in.pack_valid = false;
@@ -104,6 +129,7 @@ int main() {
     test_csv_bounds();
     test_critical_blocks_radio();
     test_low_has_hysteresis();
+    test_pack_volts_from_raw_count();
     test_missing_pack_keeps_backend();
     test_queue_pool_drops_oldest_and_rejects_oversize();
     if (failures) {

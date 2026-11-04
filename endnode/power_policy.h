@@ -11,6 +11,18 @@ static const float POWER_CRITICAL_V = 9.9f;
 static const uint32_t POWER_LOW_MIN_SLEEP_SEC = 1800;
 static const uint32_t POWER_CRITICAL_MIN_SLEEP_SEC = 3600;
 
+struct PackVolts {
+    float volts;
+    bool valid; // volts > 5 && volts < 20
+};
+
+inline PackVolts pack_volts_from_raw(float raw, float scale) {
+    PackVolts out;
+    out.volts = raw * scale;
+    out.valid = out.volts > 5.0f && out.volts < 20.0f;
+    return out;
+}
+
 enum PowerMode {
     POWER_NORMAL = 0,
     POWER_LOW = 1,

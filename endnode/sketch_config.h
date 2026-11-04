@@ -18,3 +18,9 @@
 #ifndef DEFAULT_DEVICE_TYPE
 #define DEFAULT_DEVICE_TYPE 2
 #endif
+#ifndef PACK_V_VALUE_NAME
+#define PACK_V_VALUE_NAME "b_v_v"
+#endif
+#ifndef PACK_V_SCALE
+#define PACK_V_SCALE 0.01f
+#endif

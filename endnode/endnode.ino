@@ -39,6 +39,7 @@
 #include "csv_parse.h"
 #include "param_limits.h"
 #include "power_policy.h"
+#include "sketch_config.h"
 #include "variant.h"
 
 // External Libraries
@@ -1026,20 +1027,58 @@ void loop() {
 }
 
 
-void apply_pack_power(const String& payload) {
-    float volts = -1;
-    const char* names[] = {"pack_v", "voltage", "vbat", "V", "b_v_v"};
-    const char* keys[] = {"\"pack_v\":", "\"voltage\":", "\"vbat\":", "\"V\":", "\"b_v_v\":"};
-    for (int i = 0; i < 5 && volts < 0; i++) {
-        int at = payload.indexOf(keys[i]);
-        if (at < 0) continue;
-        float raw = payload.substring(at + strlen(keys[i])).toFloat();
-        if (raw < 0) continue;
-        volts = raw * sensor_measure_scale(names[i]);
+static bool json_number(JsonVariant value) {
+    return !value.isNull() && !value.is<bool>() && !value.is<const char*>() && !value.is<JsonObject>() && !value.is<JsonArray>();
+}
+
+// Sample payload is {"v_s_p_0":{"b_v_v":1199}}. A full publish document nests that map under "sp".
+static bool pack_raw_from_payload(const String& payload, float* raw) {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) return false;
+    JsonObject sensors = doc.as<JsonObject>();
+    if (sensors.isNull()) return false;
+    JsonVariant wrapped = doc["sp"];
+    if (wrapped.is<JsonObject>()) sensors = wrapped.as<JsonObject>();
+    for (JsonPair entry : sensors) {
+        JsonObject reading = entry.value().as<JsonObject>();
+        if (reading.isNull()) continue;
+        if (!reading["err"].isUnbound()) continue;
+        JsonVariant value = reading[PACK_V_VALUE_NAME];
+        if (!json_number(value)) continue;
+        *raw = value.as<float>();
+        return true;
     }
+    return false;
+}
+
+void apply_pack_power(const String& payload) {
+    float scale = PACK_V_SCALE;
+    float backend_scale = 0.0f;
+    bool backend_scale_found = sensor_measure_scale_find(PACK_V_VALUE_NAME, &backend_scale);
+    if (backend_scale_found) scale = backend_scale;
+
+    float raw = 0.0f;
+    bool saw_raw = pack_raw_from_payload(payload, &raw);
+    PackVolts pv;
+    pv.volts = -1.0f;
+    pv.valid = false;
+    if (saw_raw) pv = pack_volts_from_raw(raw, scale);
+
+    #ifdef DEBUG
+        Serial.print("Pack voltage ");
+        if (saw_raw) {
+            Serial.print(pv.volts, 2);
+            Serial.print(" V");
+        } else {
+            Serial.print("absent");
+        }
+        Serial.print(" scale source ");
+        Serial.println(backend_scale_found ? "backend" : "build");
+    #endif
+
     PowerInput in = {};
-    in.pack_volts = volts;
-    in.pack_valid = volts > 5.0f && volts < 20.0f;
+    in.pack_volts = pv.volts;
+    in.pack_valid = pv.valid;
     in.previous = (PowerMode)saved_power_mode;
     in.backend_sleep_sec = TIME_TO_SLEEP_SEC;
     in.backend_reading_count = READING_COUNT;
@@ -1048,8 +1087,8 @@ void apply_pack_power(const String& payload) {
     active_sleep_sec = decision.eff_sleep_sec;
     announce_power_mode = decision.changed;
     saved_power_mode = decision.mode;
-    last_pack_volts = in.pack_valid ? volts : -1;
-    if (!in.pack_valid) {
+    last_pack_volts = pv.valid ? pv.volts : -1;
+    if (!pv.valid) {
         local_logger("Pack voltage missing or failed. Keeping the backend interval.");
         add_sensor_error("[PACK_V_MISSING]");
     }

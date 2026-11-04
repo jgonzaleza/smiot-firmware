@@ -222,21 +222,24 @@ static bool scale_from_rules(const char* value_name, const char* names_csv, cons
     return false;
 }
 
-float sensor_measure_scale(const char* value_name) {
-    if (!value_name || !value_name[0]) return 1.0f;
+bool sensor_measure_scale_find(const char* value_name, float* out) {
+    if (!value_name || !value_name[0] || !out) return false;
     for (int i = 0; i < namespaces_size; i++) {
         preferences.begin(namespace_id[i].c_str(), true);
         String names = preferences.getString("VALUE_NAMES", "");
         String scales = preferences.getString("MEASURE_SCALES", "");
         preferences.end();
-        float scale = 1.0f;
-        if (scale_from_rules(value_name, names.c_str(), scales.c_str(), &scale)) return scale;
+        if (scale_from_rules(value_name, names.c_str(), scales.c_str(), out)) return true;
     }
     preferences.begin("devcfg", true);
     String device_scales = preferences.getString("MEASURE_SCALES", "");
     preferences.end();
+    return scale_from_rules(value_name, "", device_scales.c_str(), out);
+}
+
+float sensor_measure_scale(const char* value_name) {
     float scale = 1.0f;
-    if (scale_from_rules(value_name, "", device_scales.c_str(), &scale)) return scale;
+    if (sensor_measure_scale_find(value_name, &scale)) return scale;
     return 1.0f;
 }
 
