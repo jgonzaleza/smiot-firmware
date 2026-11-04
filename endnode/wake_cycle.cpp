@@ -27,12 +27,12 @@ void boot_start(WakeState& wake) {
     g_wake_start_ms = millis();
     rtc_persist_boot();
     ota_note_boot();
-    daily_log_boot((int)esp_reset_reason());
     comm.setClient(&cell_client);
     if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {
         load_device_params();
     }
     Serial.begin(115200);
+    daily_log_boot((int)esp_reset_reason());
     Serial.println(ESP.getEfuseMac());
     gpio_hold_dis((gpio_num_t)PIN_5V_EN);
     gpio_hold_dis((gpio_num_t)RS485_EN_PIN);
