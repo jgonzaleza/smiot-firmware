@@ -1,11 +1,18 @@
 #include "CellularCommunicationClient.h"
+#include "network_policy.h"
 
 extern TinyGsm modem;
 
 bool CellularCommunicationClient::init_network() { return modem.isNetworkConnected(); }
 SimStatus CellularCommunicationClient::getSimStatus() { return modem.getSimStatus(); }
 bool CellularCommunicationClient::setNetworkMode(NetworkMode mode) { return modem.setNetworkMode(mode); }
-String CellularCommunicationClient::getSimCCID() { return modem.getSimCCID(); }
+String CellularCommunicationClient::getSimCCID() {
+    // A7608 getSimCCIDImpl keeps the "+ICCID: " prefix. Callers need the digits.
+    String raw = modem.getSimCCID();
+    char digits[24];
+    iccid_digits(raw.c_str(), digits, sizeof(digits));
+    return String(digits);
+}
 RegStatus CellularCommunicationClient::getRegistrationStatus() { return modem.getRegistrationStatus(); }
 bool CellularCommunicationClient::enableNetwork() { return modem.enableNetwork(); }
 String CellularCommunicationClient::getLocalIP() { return modem.getLocalIP(); }

@@ -1,16 +1,17 @@
 # Per-device certificates
 
-The fleet currently shares one AWS IoT certificate. A leak of that certificate exposes every device. The replacement is one certificate per device, issued by AWS IoT fleet provisioning.
+The fleet currently shares one AWS IoT certificate. A leak of that certificate exposes every device.
 
-That provisioning flow is backend work. This repository does not contain AWS account ids, provisioning claim certificates, private keys, or fleet templates.
+The chosen replacement is AWS IoT fleet provisioning by claim. That work is deferred to the next iteration. This repository does not implement it, and it does not contain AWS account ids, claim certificates, private keys, or provisioning templates.
 
-## Device side
+## Next iteration
 
-- The modem stores the device certificate and private key once, in its own certificate store (`ca_cert.pem` stays the Amazon root; the client cert and key are the device pair).
-- The store entry is keyed by the device MAC from `ESP.getEfuseMac()`, which is already the MQTT client identity.
-- `AT+CCERTLIST` is checked before another upload so a reboot does not rewrite the same files.
-- Revoking one device is a backend change to that certificate. The shared certificate can be retired after the fleet has moved.
+The backend project owns the claim certificate, the provisioning template, and the pre-provisioning Lambda.
 
-## Backend side
+The firmware will:
 
-The backend project owns fleet provisioning: the claim certificate, the provisioning template, and writing the new certificate id back to the device record. Do not invent those credentials in this repository.
+- Connect with the claim certificate.
+- Call `CreateKeysAndCertificate` and `RegisterThing`.
+- Store the device certificate in NVS and in the modem.
+
+Until that lands, devices keep using the shared certificate. Do not add claim material or a provisioning flow to this tree.
