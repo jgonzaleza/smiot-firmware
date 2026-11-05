@@ -101,12 +101,12 @@ String publish_topic_prefix = "smartiotcr/"; // Topics for MQTT publishing
 String subscribe_topic_prefix = "smartiotcr/parameters/v2/"; // Topic to subscribe for parameters
 
 // API Gateway URLs
-const char *CHECK_FIRMWARE_UPDATE_URL = "https://junkzqt2yc.execute-api.us-east-1.amazonaws.com/pro/device_firmware_config";
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
 #include "secrets.example.h"
 #endif
+#include "firmware_update_request.h"
 #ifndef CHECK_FIRMWARE_KEY
 #define CHECK_FIRMWARE_KEY ""
 #endif
@@ -594,17 +594,20 @@ JsonDocument check_firmware_update(){
     // Send GET request
     comm.https_add_header("X-API-Key", CHECK_FIRMWARE_KEY);
     int httpCode = 0;
-    String post_payload = "{\"client_id\": \"";
-    post_payload.concat(client_id_prefix);
-    post_payload.concat("\", \"device_type\":");
-    post_payload.concat(active_device_type);
-    post_payload.concat(", \"variant\":\"");
-    post_payload.concat(VARIANT_ID);
-    post_payload.concat(", \"firmware_version\":");
-    post_payload.concat(firmware_version);
-    post_payload.concat(", \"device_id\": \"");
-    post_payload.concat(ESP.getEfuseMac());
-    post_payload.concat("\"}");
+    char post_payload[256];
+    int post_len = firmware_update_request_body(
+        post_payload,
+        sizeof(post_payload),
+        client_id_prefix,
+        active_device_type,
+        VARIANT_ID,
+        firmware_version,
+        ESP.getEfuseMac());
+    if (post_len < 0) {
+        Serial.println("Firmware update request body did not fit");
+        comm.https_end();
+        return parameters_payload;
+    }
     httpCode = comm.https_post(post_payload);
     if (httpCode != 200) {
         Serial.print("HTTP POST failed ! error code = "); 
