@@ -42,9 +42,24 @@ void CellularCommunicationClient::mqtt_set_certificate(const char* root_ca, cons
 }
 bool CellularCommunicationClient::mqtt_handle(uint32_t timeout) { return modem.mqtt_handle(timeout); }
 
-bool CellularCommunicationClient::https_begin() { return modem.https_begin(); }
+bool CellularCommunicationClient::https_begin() {
+    // HTTPS uses SSL context 1 with CA authentication. MQTT stays on context 0.
+    modem.sendAT(GF("+CSSLCFG=\"sslversion\",1,3"));
+    modem.waitResponse();
+    modem.sendAT(GF("+CSSLCFG=\"enableSNI\",1,1"));
+    modem.waitResponse();
+    modem.sendAT(GF("+CSSLCFG=\"cacert\",1,\"ca_cert.pem\""));
+    modem.waitResponse();
+    modem.sendAT(GF("+CSSLCFG=\"authmode\",1,1"));
+    modem.waitResponse();
+    bool started = modem.https_begin();
+    if (started) modem.https_set_ssl_index(1);
+    return started;
+}
 void CellularCommunicationClient::https_end() { modem.https_end(); }
-bool CellularCommunicationClient::https_set_url(const String& url) { return modem.https_set_url(url); }
+bool CellularCommunicationClient::https_set_url(const String& url) {
+    return modem.https_set_url(url, TINYGSM_SSL_TLS1_2, true);
+}
 bool CellularCommunicationClient::https_add_header(const char* key, const char* value) { return modem.https_add_header(key, value); }
 int CellularCommunicationClient::https_get() { return modem.https_get(); }
 size_t CellularCommunicationClient::https_get_size() { return modem.https_get_size(); }

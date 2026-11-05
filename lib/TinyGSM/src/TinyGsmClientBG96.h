@@ -332,7 +332,7 @@ class TinyGsmBG96 : public TinyGsmModem<TinyGsmBG96>,
     return true;
   }
 
-  bool disableGPSImpl(int8_t power_en_pin ,uint8_t disbale_level) {
+  bool disableGPSImpl(int8_t power_en_pin ,uint8_t disable_level) {
     sendAT(GF("+QGPSEND"));
     if (waitResponse() != 1) { return false; }
     return true;
@@ -484,7 +484,7 @@ class TinyGsmBG96 : public TinyGsmModem<TinyGsmBG96>,
    * NTP server functions
    */
 
-  byte NTPServerSyncImpl(const String& server = "pool.ntp.org", byte = -5) {
+  int NTPServerSyncImpl(const String& server = "pool.ntp.org", byte = -5) {
     // Request network synchronization
     // AT+QNTP=<contextID>,<server>[,<port>][,<autosettime>]
     sendAT(GF("+QNTP=1,\""), server, '"');

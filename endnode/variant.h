@@ -6,3 +6,7 @@
 #else
 #define VARIANT_ID "cell"
 #endif
+
+#ifndef API_STAGE
+#define API_STAGE "prod"
+#endif

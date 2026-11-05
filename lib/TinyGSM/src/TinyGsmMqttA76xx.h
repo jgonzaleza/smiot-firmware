@@ -25,6 +25,11 @@ protected:
     const char  *cert_pem;           /*!< SSL server certification, PEM format as string, if the client requires to verify server */
     const char  *client_cert_pem;    /*!< SSL client certification, PEM format as string, if the server requires to verify client */
     const char  *client_key_pem;     /*!< SSL client key, PEM format as string, if the server requires to verify client */
+    const char  *will_topic;
+    const char  *will_msg;
+    uint8_t will_qos = 0;
+    bool _isConnected = false;
+    uint32_t _lastCheckConnect = 0;
 
 public:
     /*
@@ -32,6 +37,19 @@ public:
      */
     bool mqtt_begin(bool ssl, bool sni = false)
     {
+        // Clean up previous MQTT connection if any
+        thisModem().sendAT("+CMQTTDISC=0,120");
+        thisModem().waitResponse();
+        thisModem().sendAT("+CMQTTDISC=1,120");
+        thisModem().waitResponse();
+        thisModem().sendAT("+CMQTTREL=0,120");
+        thisModem().waitResponse();
+        thisModem().sendAT("+CMQTTREL=1,120");
+        thisModem().waitResponse();
+        thisModem().sendAT("+CMQTTSTOP");
+        thisModem().waitResponse();
+        delay(20);  //Wait 20 ms
+
         __sni = sni;
         __ssl = ssl;
         if (!this->buffer) {
@@ -41,6 +59,8 @@ public:
         this->cert_pem = NULL;
         this->client_cert_pem = NULL;
         this->client_key_pem = NULL;
+        _isConnected = false;
+        _lastCheckConnect = 0;
         memset(this->buffer, 0, bufferSize);
         thisModem().sendAT("+CMQTTSTART");
         if (thisModem().waitResponse(30000UL, "+CMQTTSTART: 0") != 1)return false;
@@ -54,6 +74,8 @@ public:
             free(this->buffer);
             this->buffer = NULL;
         }
+        _isConnected = false;
+        _lastCheckConnect = 0;
         thisModem().sendAT("+CMQTTSTOP");
         thisModem().waitResponse("+CMQTTSTOP: 0");
         if (thisModem().waitResponse(3000) != 1)return false;
@@ -72,6 +94,13 @@ public:
         this->client_key_pem = clientCertKey;
     }
 
+    void setWillMessage(const char *topic, const char *msg, uint8_t qos)
+    {
+        will_msg = msg;
+        will_topic = topic;
+        will_qos = qos;
+    }
+
     bool mqtt_connect(
         uint8_t clientIndex,
         const char *server, uint16_t port,
@@ -87,6 +116,7 @@ public:
         }
 
         if (this->cert_pem || this->client_cert_pem || this->client_key_pem) {
+            // Local edit: upload a certificate only when CCERTLIST does not already have it.
             bool certs_present = false;
             thisModem().sendAT("+CCERTLIST");
             String cert_list;
@@ -163,7 +193,8 @@ public:
                 authMethod = 0;
             }
 
-            thisModem().sendAT("+CSSLCFG=\"sslversion\",0,4");
+            // Local edit: MQTT context 0 is TLS 1.2 (sslversion 3). Authmode stays 2 below.
+            thisModem().sendAT("+CSSLCFG=\"sslversion\",0,3");
             thisModem().waitResponse();
 
             thisModem().sendAT("+CMQTTSSLCFG=", clientIndex, ",", 0);
@@ -185,8 +216,21 @@ public:
         thisModem().waitResponse(3000);
 
         thisModem().sendAT("+CMQTTACCQ=", clientIndex, ",\"", clientID, "\",", __ssl);
-
         if (thisModem().waitResponse(3000) != 1)return false;
+
+        // Set MQTT3.1.1 , Default use MQTT 3.1
+        thisModem().sendAT("+CMQTTCFG=\"version\",", clientIndex, ",4");
+        thisModem().waitResponse(30000UL);
+
+        if (will_msg && will_topic) {
+            if (!mqttWillTopic(clientIndex, will_topic)) {
+                return false;
+            }
+            if (!mqttWillMessage(clientIndex, will_msg, will_qos)) {
+                return false;
+            }
+        }
+
         if (username && password) {
             thisModem().sendAT("+CMQTTCONNECT=", clientIndex, ',', "\"tcp://", server, ':', port, "\",", keepalive_time, ',', 1, ",\"", username, "\",\"", password, "\"");
         } else {
@@ -227,7 +271,7 @@ public:
     }
 
     bool mqtt_publish(uint8_t clientIndex, const char *topic, const char *playload,
-                      uint8_t qos = 0, uint32_t timeout = 60)
+                      uint8_t qos = 0, uint32_t timeout = 60, uint8_t retain = 0)
     {
         if (clientIndex > muxCount) {
             return false;
@@ -261,19 +305,21 @@ public:
         }
         // +CMQTTPUB: (0-1),(0-2),(60-180),(0-1),(0-1)
         // <client_index>,<qos>,<pub_timeout>,<ratained>,<dup>
-        thisModem().sendAT("+CMQTTPUB=", clientIndex, ',', qos, ',', timeout);
+        thisModem().sendAT("+CMQTTPUB=", clientIndex, ',', qos, ',', timeout, ',', retain );
         if (thisModem().waitResponse() != 1) {
             return false;
         }
         return true;
     }
 
-    bool mqtt_subscribe(uint8_t clientIndex, const char *topic, uint8_t qos = 0)
+    bool mqtt_subscribe(uint8_t clientIndex, const char *topic, uint8_t qos = 0, uint8_t dup = 0)
     {
         if (clientIndex > muxCount) {
             return false;
         }
-        thisModem().sendAT("+CMQTTSUBTOPIC=", clientIndex, ',', strlen(topic), ',', qos);
+        // Subscribe a message to server
+        // +CMQTTSUB: (0-1),(1-1024),(0-2),(0-1)
+        thisModem().sendAT("+CMQTTSUB=", clientIndex, ',', strlen(topic), ',', qos, ',', dup);
         if (thisModem().waitResponse(10000UL, ">") != 1) {
             return false;
         }
@@ -281,12 +327,6 @@ public:
         thisModem().stream.write(topic);
         thisModem().stream.println();
         // Wait return OK
-        if (thisModem().waitResponse(10000UL) != 1) {
-            return false;
-        }
-        // Subscribe a message to server
-        // +CMQTTSUB: (0-1),(1-1024),(0-2),(0-1)
-        thisModem().sendAT("+CMQTTSUB=", clientIndex);
         if (thisModem().waitResponse(10000UL) != 1) {
             return false;
         }
@@ -332,11 +372,10 @@ public:
         if (clientIndex > muxCount) {
             return false;
         }
-        static uint32_t lastCheck = 0;
-        if (millis() - lastCheck < 10000) {
-            return true;
+        if (millis() - _lastCheckConnect < 10000) {
+            return _isConnected;
         }
-        lastCheck = millis();
+        _lastCheckConnect = millis();
         int result = 0;
         int i = TINY_GSM_MQTT_CLI_COUNT;
         thisModem().sendAT("+CMQTTDISC?");
@@ -345,17 +384,25 @@ public:
                 if (thisModem().streamGetIntBefore(',') == clientIndex) {
                     result = thisModem().streamGetIntBefore('\n');
                     thisModem().waitResponse();
-                    return result == 0;
+                    _isConnected =  (result == 0);
+                    return _isConnected;
                 }
             }
         }
+        _isConnected = false;
         return false;
     }
+
+
+
 
     bool mqtt_set_rx_buffer_size(uint32_t size)
     {
         if (size == 0) {
             return false;
+        }
+        if (size == this->bufferSize) {
+            return true;
         }
         if (this->bufferSize == 0) {
             this->buffer = (uint8_t *)TINY_GSM_MALLOC(size);
@@ -448,6 +495,68 @@ public:
             }
         }
         return false;
+    }
+
+
+protected:
+    bool mqttWillTopic(uint8_t clientIndex, const char *topic)
+    {
+        if (clientIndex > muxCount) {
+            DBG("Error: Client index out of bounds");
+            return false;
+        }
+
+        // Set the Will topic
+        // +CMQTTWILLTOPIC: <client_index>,<req_length>
+        thisModem().sendAT("+CMQTTWILLTOPIC=", clientIndex, ',', strlen(topic));
+
+        int response = thisModem().waitResponse(10000UL, ">");
+        if (response != 1) {
+            DBG("Error: Did not receive expected '>' prompt, response: ", response);
+            return false;
+        }
+
+        // Send the actual topic
+        thisModem().stream.write(topic);
+        thisModem().stream.println();
+
+        response = thisModem().waitResponse();
+        if (response != 1) {
+            DBG("Error: Did not receive 'OK' after sending the Will topic, response: ", response);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool mqttWillMessage(uint8_t clientIndex, const char *message, uint8_t qos)
+    {
+        if (clientIndex > muxCount) {
+            DBG("Error: Client index out of bounds");
+            return false;
+        }
+
+        // Set the Will message
+        // +CMQTTWILLMSG: <client_index>,<req_length>,<qos>
+        thisModem().sendAT("+CMQTTWILLMSG=", clientIndex, ',', strlen(message), ',', qos);
+
+        int response = thisModem().waitResponse(10000UL, ">");
+        if (response != 1) {
+            DBG("Error: Did not receive expected '>' prompt, response: ", response);
+            return false;
+        }
+
+        // Send the actual message
+        thisModem().stream.write(message);
+        thisModem().stream.println();
+
+        response = thisModem().waitResponse();
+        if (response != 1) {
+            DBG("Error: Did not receive 'OK' after sending the Will message, response: ", response);
+            return false;
+        }
+
+        return true;
     }
     /*
      * CRTP Helper

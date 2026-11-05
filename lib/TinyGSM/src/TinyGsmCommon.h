@@ -10,7 +10,7 @@
 #define SRC_TINYGSMCOMMON_H_
 
 // The current library version number
-#define TINYGSM_VERSION "0.11.7"
+#define TINYGSM_VERSION "1.0.0"
 
 #if defined(SPARK) || defined(PARTICLE)
 #include "Particle.h"
@@ -32,12 +32,32 @@
 #define TINY_GSM_YIELD_MS 0
 #endif
 
+#if defined(ESP32)
+// Runtime PSRAM detection: checked once at first use, cached for subsequent calls.
+static inline bool tinygsm_has_psram() {
+    static const bool _psram = psramFound();
+    return _psram;
+}
+static inline void* tinygsm_malloc(size_t size) {
+    void* p = nullptr;
+    if (tinygsm_has_psram()) p = ps_malloc(size);
+    return p ? p : malloc(size);
+}
+static inline void* tinygsm_realloc(void* ptr, size_t size) {
+    if (tinygsm_has_psram()) return ps_realloc(ptr, size);
+    return realloc(ptr, size);
+}
+#define TINY_GSM_MALLOC  tinygsm_malloc
+#define TINY_GSM_REALLOC tinygsm_realloc
+#else
+// Non-ESP32: keep existing compile-time BOARD_HAS_PSRAM behaviour.
 #ifdef BOARD_HAS_PSRAM
 #define TINY_GSM_MALLOC       ps_malloc
 #define TINY_GSM_REALLOC      ps_realloc
 #else
 #define TINY_GSM_MALLOC       malloc
 #define TINY_GSM_REALLOC      realloc
+#endif
 #endif
 
 
@@ -124,5 +144,15 @@ uint32_t TinyGsmAutoBaud(T& SerialAT, uint32_t minimum = 9600,
   SerialAT.begin(minimum);
   return 0;
 }
+
+enum ModemPlatform {
+    ASR_A7670X,
+    ASR_A7608X,
+    QUALCOMM_SIM7670G,
+    QUALCOMM_SIM7600G,
+    QUALCOMM_SIM7080G,
+    QUALCOMM_SIM7000G
+};
+
 
 #endif  // SRC_TINYGSMCOMMON_H_

@@ -1,21 +1,21 @@
 # TinyGSM vendor record
 
-This tree vendors a TinyGSM snapshot imported with firmware 3.0.0.
-
 | Field | Value |
 | --- | --- |
-| Declared version | 0.11.7 (`library.json`) |
-| Fork | LilyGO [LilyGo-Modem-Series](https://github.com/Xinyuan-LilyGO/LilyGo-Modem-Series) |
-| Upstream SHA | Unknown. The import did not record a commit. |
-| `library.json` sha256 | `f6b7d04011b6d0fdc489488089e6b077aeff65af2db43be09d3f9226e37defdd` |
-| `src/TinyGsmClientA7608.h` sha256 | `27b4b7a0bc28d733feb60452f3e5c40618ed47642facfccf8cea5a254e369e18` |
+| Version | 1.0.0 (`library.json`) |
+| Source | LilyGO [LilyGo-Modem-Series](https://github.com/Xinyuan-LilyGO/LilyGo-Modem-Series) |
+| Commit | `d6165e3d427e8a4603b9d0999ac929b7d8412824` (short `d6165e3`) |
+| Path in that tree | `lib/TinyGSM` |
+| Taken from | `https://github.com/Xinyuan-LilyGO/LilyGo-Modem-Series/archive/d6165e3.tar.gz` |
 
-No separate local delta could be extracted from the 3.0.0 import: the snapshot is the baseline, and its LilyGO commit was not identified.
+## Local edits
 
-## Local edits after import
+`patches/v3.4.0-on-1.0.0.patch` is the diff against that commit. Only these edits are reapplied:
 
-`patches/v3.1.0-local-edits.patch` (applied in this tree):
+- `TinyGsmHttpsComm.h`: HTTPS `sslversion` and SNI are written to SSL context 1, not context 0. `https_get_size()` waits 20 seconds instead of 120.
+- `TinyGsmMqttA76xx.h`: `AT+CCERTLIST` runs before `AT+CCERTDOWN`. MQTT context 0 uses `sslversion` 3 (TLS 1.2). When the client certificate and key are both present, `authmode` stays 2.
+- `TinyGsmClientA7608.h`: `enableNetwork()` and `disableNetwork()` are restored. 1.0.0 replaced them with `setNetworkActive()`, which closes the PDP before every open.
 
-- `https_get_size()` waits at most 20 seconds instead of 120. The A7608 `waitResponse` loop calls `TINY_GSM_YIELD()`, which the firmware defines to feed the task watchdog.
+The N/S and E/W GPS sign is already applied in this commit (`TinyGsmClientA76xx.h` `getGPSImpl`). That older local edit is not reapplied.
 
-The N/S and E/W GPS sign is applied in `TinyGsmClientA7608.h` (v3.2.0). South and west readings are stored as negative degrees. The diff is `patches/v3.2.0-gps-sign.patch`.
+The firmware still configures HTTPS context 1 (`cacert`, `authmode` 1, `https_set_ssl_index(1)`) in `CellularCommunicationClient` and passes `TINYGSM_SSL_TLS1_2` into `https_set_url`.

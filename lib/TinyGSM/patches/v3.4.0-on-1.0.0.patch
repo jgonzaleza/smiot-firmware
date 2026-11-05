@@ -1,0 +1,126 @@
+diff -ruN /tmp/lilygo-tgz/lib/TinyGSM/src/TinyGsmClientA7608.h lib/TinyGSM/src/TinyGsmClientA7608.h
+--- /tmp/lilygo-tgz/lib/TinyGSM/src/TinyGsmClientA7608.h	2026-11-01 19:50:12
++++ lib/TinyGSM/src/TinyGsmClientA7608.h	2026-11-02 10:58:31
+@@ -113,6 +113,23 @@
+     memset(sockets, 0, sizeof(sockets));
+   }
+ 
++  // Local edit: 0.11.7 exposed these names. 1.0.0 folded them into
++  // setNetworkActive(), which closes the PDP before every open. Keep the
++  // open-only and close-only calls the firmware already uses.
++  bool enableNetwork() {
++    sendAT(GF("+NETOPEN"));
++    int res = waitResponse(GF("+NETOPEN: 0"),
++                           GF("+IP ERROR: Network is already opened"));
++    return res == 1 || res == 2;
++  }
++
++  bool disableNetwork() {
++    sendAT(GF("+NETCLOSE"));
++    if (waitResponse() != 1) { return false; }
++    int res = waitResponse(GF("+NETCLOSE: 0"), GF("+NETCLOSE: 2"));
++    return res == 1 || res == 2;
++  }
++
+   /*
+    * Basic functions
+    */
+diff -ruN /tmp/lilygo-tgz/lib/TinyGSM/src/TinyGsmHttpsComm.h lib/TinyGSM/src/TinyGsmHttpsComm.h
+--- /tmp/lilygo-tgz/lib/TinyGSM/src/TinyGsmHttpsComm.h	2026-11-01 19:50:12
++++ lib/TinyGSM/src/TinyGsmHttpsComm.h	2026-11-02 10:58:21
+@@ -77,11 +77,12 @@
+   bool https_set_url(const String& url, ServerSSLVersion ssl_version = TINYGSM_SSL_AUTO, bool enableSNI = true) {
+     // https://github.com/Xinyuan-LilyGO/LilyGO-T-A76XX/issues/243
+     // Set SSL Version
+-    thisModem().sendAT("+CSSLCFG=\"sslversion\",0,", ssl_version);
++    // Local edit: HTTPS uses SSL context 1. Context 0 stays the MQTT session.
++    thisModem().sendAT("+CSSLCFG=\"sslversion\",1,", ssl_version);
+     thisModem().waitResponse();
+ 
+-    // Set SNI
+-    thisModem().sendAT("+CSSLCFG=\"enableSNI\",0,", enableSNI ? 1 : 0);
++    // Set SNI on the HTTPS context.
++    thisModem().sendAT("+CSSLCFG=\"enableSNI\",1,", enableSNI ? 1 : 0);
+     thisModem().waitResponse();
+ 
+     thisModem().sendAT("+HTTPPARA=\"URL\",", "\"", url, "\"");
+@@ -357,7 +358,8 @@
+    */
+   size_t https_get_size(void) {
+     thisModem().sendAT("+HTTPREAD?");
+-    if (thisModem().waitResponse(120000UL, "+HTTPREAD: LEN,") != 1) { return 0; }
++    // Local edit: 20s deadline so a stalled read cannot sit for 120s.
++    if (thisModem().waitResponse(20000UL, "+HTTPREAD: LEN,") != 1) { return 0; }
+     size_t length = thisModem().streamGetLongLongBefore('\r');
+     thisModem().waitResponse();
+     return length;
+diff -ruN /tmp/lilygo-tgz/lib/TinyGSM/src/TinyGsmMqttA76xx.h lib/TinyGSM/src/TinyGsmMqttA76xx.h
+--- /tmp/lilygo-tgz/lib/TinyGSM/src/TinyGsmMqttA76xx.h	2026-11-01 19:50:12
++++ lib/TinyGSM/src/TinyGsmMqttA76xx.h	2026-11-02 10:58:32
+@@ -116,7 +116,16 @@
+         }
+ 
+         if (this->cert_pem || this->client_cert_pem || this->client_key_pem) {
+-            if (this->cert_pem) {
++            // Local edit: upload a certificate only when CCERTLIST does not already have it.
++            bool certs_present = false;
++            thisModem().sendAT("+CCERTLIST");
++            String cert_list;
++            if (thisModem().waitResponse(5000UL, cert_list) == 1) {
++                certs_present = cert_list.indexOf("ca_cert.pem") >= 0
++                    && cert_list.indexOf("\"cert.pem\"") >= 0
++                    && cert_list.indexOf("key_cert.pem") >= 0;
++            }
++            if (this->cert_pem && !certs_present) {
+                 thisModem().sendAT("+CCERTDOWN=\"ca_cert.pem\",", strlen(this->cert_pem));
+                 if (thisModem().waitResponse(10000UL, ">") == 1) {
+                     thisModem().stream.write(this->cert_pem);
+@@ -129,7 +138,7 @@
+                 thisModem().waitResponse();
+ 
+             }
+-            if (this->client_cert_pem) {
++            if (this->client_cert_pem && !certs_present) {
+                 thisModem().sendAT("+CCERTDOWN=\"cert.pem\",", strlen(this->client_cert_pem));
+                 if (thisModem().waitResponse(10000UL, ">") == 1) {
+                     thisModem().stream.write(this->client_cert_pem);
+@@ -142,7 +151,7 @@
+                 thisModem().waitResponse();
+ 
+             }
+-            if (this->client_key_pem) {
++            if (this->client_key_pem && !certs_present) {
+                 thisModem().sendAT("+CCERTDOWN=\"key_cert.pem\",", strlen(this->client_key_pem));
+                 if (thisModem().waitResponse(10000UL, ">") == 1) {
+                     thisModem().stream.write(this->client_key_pem);
+@@ -154,6 +163,20 @@
+                 thisModem().sendAT("+CSSLCFG=\"clientkey\",0,\"key_cert.pem\"");
+                 thisModem().waitResponse();
+             }
++            if (certs_present) {
++                if (this->cert_pem) {
++                    thisModem().sendAT("+CSSLCFG=\"cacert\",0,\"ca_cert.pem\"");
++                    thisModem().waitResponse();
++                }
++                if (this->client_cert_pem) {
++                    thisModem().sendAT("+CSSLCFG=\"clientcert\",0,\"cert.pem\"");
++                    thisModem().waitResponse();
++                }
++                if (this->client_key_pem) {
++                    thisModem().sendAT("+CSSLCFG=\"clientkey\",0,\"key_cert.pem\"");
++                    thisModem().waitResponse();
++                }
++            }
+ 
+             // authMethod:
+             // 0 – no authentication.
+@@ -170,7 +193,8 @@
+                 authMethod = 0;
+             }
+ 
+-            thisModem().sendAT("+CSSLCFG=\"sslversion\",0,4");
++            // Local edit: MQTT context 0 is TLS 1.2 (sslversion 3). Authmode stays 2 below.
++            thisModem().sendAT("+CSSLCFG=\"sslversion\",0,3");
+             thisModem().waitResponse();
+ 
+             thisModem().sendAT("+CMQTTSSLCFG=", clientIndex, ",", 0);
