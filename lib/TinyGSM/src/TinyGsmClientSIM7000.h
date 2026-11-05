@@ -18,10 +18,30 @@
 #include "TinyGsmClientSIM70xx.h"
 #include "TinyGsmTCP.tpp"
 
+enum NMEA_Sentences {
+    NMEA_GPGGA   = _BV(0),    // Bit 0: GPGGA (global positioning system fix data)
+    NMEA_GPRMC   = _BV(1),    // Bit 1: GPRMC (recommended minimum specific GPS/TRANSIT data)
+    NMEA_GPGSV   = _BV(2),    // Bit 2: GPGSV (GPS satellites in view)
+    NMEA_GPGSA   = _BV(3),    // Bit 3: GPGSA (GPS DOP and active satellites)
+    NMEA_GPVTG   = _BV(4),    // Bit 4: GPVTG (track made good and ground speed)
+    NMEA_PQXFI   = _BV(5),    // Bit 5: PQXFI (Global Positioning System Extended Fix Data)
+    NMEA_GLGSV   = _BV(6),    // Bit 6: GLGSV (GLONASS satellites in view GLONASS fixes only)
+    NMEA_GNGSA   = _BV(7),    // Bit 7: GNGSA (1. GPS/2. Glonass/3. GALILE DOP and Active Satellites)
+    NMEA_GNGNS   = _BV(8),    // Bit 8: GNGNS (fix data for GNSS receivers;output for GPS,GLONASS,GALILEO)
+    // Bit 9: reserve
+    NMEA_GAGSV   = _BV(10),   // Bit 10: GAGSV (GALILEO satellites in view)
+    // Bit 11: reserve
+    // Bit 12: reserve
+    // Bit 13: reserve
+    // Bit 14: reserve
+    // Bit 15: reserve
+    NMEA_BDGSA_PQGSA = _BV(16),  // Bit 16: BDGSA/PQGSA (BEIDOU/QZSS DOP and active satellites)
+    NMEA_BDGSV_PQGSV = _BV(17)   // Bit 17: BDGSV/PQGSV (BEIDOUQZSS satellites in view)
+};
 
-class TinyGsmSim7000 : public TinyGsmSim70xx<TinyGsmSim7000>,
+class TinyGsmSim7000 : public TinyGsmSim70xx<TinyGsmSim7000,QUALCOMM_SIM7000G>,
                        public TinyGsmTCP<TinyGsmSim7000, TINY_GSM_MUX_COUNT> {
-  friend class TinyGsmSim70xx<TinyGsmSim7000>;
+  friend class TinyGsmSim70xx<TinyGsmSim7000,QUALCOMM_SIM7000G>;
   friend class TinyGsmTCP<TinyGsmSim7000, TINY_GSM_MUX_COUNT>;
 
   /*
@@ -92,7 +112,7 @@ class TinyGsmSim7000 : public TinyGsmSim70xx<TinyGsmSim7000>,
    */
  public:
   explicit TinyGsmSim7000(Stream& stream)
-      : TinyGsmSim70xx<TinyGsmSim7000>(stream) {
+      : TinyGsmSim70xx<TinyGsmSim7000,QUALCOMM_SIM7000G>(stream) {
     memset(sockets, 0, sizeof(sockets));
   }
 
@@ -158,20 +178,26 @@ class TinyGsmSim7000 : public TinyGsmSim70xx<TinyGsmSim7000>,
     return res;
   }
 
-  bool setNetworkActiveImpl(){
-    sendAT(GF("+CNACT=1"));
+  bool setNetworkDeactivateImpl() {
+    if (!getNetworkActiveImpl()) { return true; }
+    sendAT(GF("+CNACT=0"));
     if (waitResponse(10000L) != 1) { return false; }
+    if (waitResponse(60000L,"+APP PDP: DEACTIVE") != 1) { return false; }
     return true;
   }
 
-  String getNetworkActiveImpl(){
+  bool setNetworkActiveImpl(){
+    sendAT(GF("+CNACT=1"));
+    if (waitResponse(10000L) != 1) { return false; }
+    if (waitResponse(60000L,"+APP PDP: ACTIVE") != 1) { return false; }
+    return true;
+  }
+
+  bool getNetworkActiveImpl(){
     sendAT(GF("+CNACT?"));
-    String res;
-    if (waitResponse(GF(GSM_NL "+CNACT: 1")) != 1) { return ""; }
-    streamSkipUntil('\"');
-    res = stream.readStringUntil('\"');
+    if (waitResponse(GF(GSM_NL "+CNACT: 1")) != 1) { return false; }
     waitResponse();
-    return res;
+    return true;
   }
 
   /*

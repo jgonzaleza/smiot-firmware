@@ -19,10 +19,26 @@
 #include "TinyGsmTCP.tpp"
 #include "TinyGsmSSL.tpp"
 
-class TinyGsmSim7080 : public TinyGsmSim70xx<TinyGsmSim7080>,
+enum NMEA_Sentences {
+  NMEA_GPGSV   = _BV(0),    // Bit 0: GPGSV (GPS satellites in view)
+  NMEA_GLGSV   = _BV(1),    // Bit 1: GLGSV (GLONASS satellites in view GLONASS fixes only)
+  NMEA_GAGSV   = _BV(2),    // Bit 2: GAGSV (GALILEO satellites in view)
+  NMEA_BDGSV_QZGSV   = _BV(3),    // Bit 3: BEIDOU/QZSS satellites in view
+  NMEA_GPGSA_GLGSA_GAGSA_BDGSA_QZGSA = _BV(4), // Bit 4: 1. GPS/2. GLONASS/3. GALILE/4. BEIDOU/5. QZSS
+  NMEA_GNVTG_GPVTG   = _BV(5),    // Bit 5: track made good and ground speed
+  NMEA_GNRMC_GPRMC   = _BV(6),    // Bit 6: recommended minimum specific GPS/TRANSIT data
+  NMEA_GNGGA_GPGGA   = _BV(7),    // Bit 7: global positioning system fix data
+};
+
+// Redefine to support parameters of the same type
+#define NMEA_GPGGA NMEA_GNGGA_GPGGA
+#define NMEA_GPGSA NMEA_GPGSA_GLGSA_GAGSA_BDGSA_QZGSA
+#define NMEA_GPRMC NMEA_GNRMC_GPRMC
+
+class TinyGsmSim7080 : public TinyGsmSim70xx<TinyGsmSim7080,QUALCOMM_SIM7080G>,
                        public TinyGsmTCP<TinyGsmSim7080, TINY_GSM_MUX_COUNT>,
                        public TinyGsmSSL<TinyGsmSim7080> {
-  friend class TinyGsmSim70xx<TinyGsmSim7080>;
+  friend class TinyGsmSim70xx<TinyGsmSim7080,QUALCOMM_SIM7080G>;
   friend class TinyGsmTCP<TinyGsmSim7080, TINY_GSM_MUX_COUNT>;
   friend class TinyGsmSSL<TinyGsmSim7080>;
 
@@ -116,7 +132,7 @@ class TinyGsmSim7080 : public TinyGsmSim70xx<TinyGsmSim7080>,
    */
  public:
   explicit TinyGsmSim7080(Stream& stream)
-      : TinyGsmSim70xx<TinyGsmSim7080>(stream),
+      : TinyGsmSim70xx<TinyGsmSim7080,QUALCOMM_SIM7080G>(stream),
         certificates() {
     memset(sockets, 0, sizeof(sockets));
   }
@@ -199,22 +215,29 @@ class TinyGsmSim7080 : public TinyGsmSim70xx<TinyGsmSim7080>,
     return res;
   }
   
+  bool setNetworkDeactivateImpl() {
+    if(!getNetworkActiveImpl())return true;
+    sendAT(GF("+CNACT=0,0"));
+    if (waitResponse(60000L, GF(GSM_NL "+APP PDP: 0,DEACTIVE"), 
+        GSM_ERROR) != 1) { return false; }
+    return true;
+  }
   
   bool setNetworkActiveImpl(){
+    if(getNetworkActiveImpl())return true;
     sendAT(GF("+CNACT=0,1"));
     if (waitResponse(60000L, GF(GSM_NL "+APP PDP: 0,ACTIVE"),
-          GF(GSM_NL "+APP PDP: 0,DEACTIVE")) != 1) { return false; }
+          GF(GSM_NL "+APP PDP: 0,DEACTIVE"), GSM_ERROR) != 1) { return false; }
     return true;
   }
 
-  String getNetworkActiveImpl(){
+  bool getNetworkActiveImpl(){
     sendAT(GF("+CNACT?"));
-    String res;
-    if (waitResponse(GF(GSM_NL "+CNACT: 0")) != 1) { return ""; }
-    streamSkipUntil('\"');
-    res = stream.readStringUntil('\"');
+    if (waitResponse(GF(GSM_NL "+CNACT: ")) != 1) { return ""; }
+    streamGetIntBefore(',');
+    int16_t  connected = streamGetIntBefore(',');
     waitResponse();
-    return res;
+    return connected == 1;
   }
 
   /*

@@ -38,6 +38,10 @@
 #include "queue_manager.h"
 #include "csv_parse.h"
 #include "param_limits.h"
+#include "param_flags.h"
+#include "power_policy.h"
+#include "sketch_config.h"
+#include "variant.h"
 
 // External Libraries
 #include <ModbusMaster.h>
@@ -47,12 +51,12 @@
 #include <ArduinoJson.h>
 #include <ctime> 
 #include <Update.h>
-#include <WiFi.h>
 #include <driver/rtc_io.h>
 #include <string.h>
 #include <Preferences.h>
 #include <SPI.h>
 #include <SD.h>
+#include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
 #include <vector>
 
@@ -60,18 +64,29 @@
 #include "certs/AWSClientCertificate.h"
 #include "certs/AWSClientPrivateKey.h"
 #include "certs/AmazonRootCA.h"
+#include "CommunicationManager.h"
+#include "CellularCommunicationClient.h"
+#ifdef FEATURE_WIFI
+#include "WifiCommunicationClient.h"
+#endif
+
+// Production builds leave DEBUG unset, so console prints compile to a dead branch.
+#ifndef DEBUG
+#define Serial if (false) Serial
+#endif
 
 
 // ================= CONSTANTS & CONFIG ================= //
 
-// Network
-#define DEFAULT_NETWORK_APN "hologram" // Default APN
-const char *hologram_apn = "hologram"; 
-const char *hologram_id = "89464";
-const char *emnify_apn = "emnify";
-const char *emnify_id = "89883";
+// Network. DEFAULT_NETWORK_APN and SIM_PREFIXES live in sketch_config.h.
 String global_apn = DEFAULT_NETWORK_APN;
-const char* CR_NETWORKS[4] = {"AUTO", "71203", "71204", "71201"};
+String sim_label = "";
+String sim_iccid = "";
+String registered_plmn = "";
+RTC_DATA_ATTR bool sim_unknown_reported = false;
+RTC_DATA_ATTR uint32_t net_sticky_since = 0;
+char plmn_table[4][8] = {"AUTO", "71203", "71204", "71201"};
+long timezone_offset_sec = -21600;
 #define MAX_CONSECUTIVE_FAILURES 12 // Max number of consecutive failures before giving up and restarting
 #define MAX_NETWORK_FAILURES 3 // Max consecutive network failures before we trigger a network change
 
@@ -87,11 +102,22 @@ String subscribe_topic_prefix = "smartiotcr/parameters/v2/"; // Topic to subscri
 
 // API Gateway URLs
 const char *CHECK_FIRMWARE_UPDATE_URL = "https://junkzqt2yc.execute-api.us-east-1.amazonaws.com/pro/device_firmware_config";
-const char *CHECK_FIRMWARE_KEY = "";
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#include "secrets.example.h"
+#endif
+#ifndef CHECK_FIRMWARE_KEY
+#define CHECK_FIRMWARE_KEY ""
+#endif
+#ifndef FIRMWARE_UPDATE_KEY
+#define FIRMWARE_UPDATE_KEY ""
+#endif
+#ifndef CONFIGURATION_SERVER_KEY
+#define CONFIGURATION_SERVER_KEY ""
+#endif
 const char *BASE_FIRMWARE_UPDATE_URL = "https://alxv44fafe.execute-api.us-east-1.amazonaws.com/dev/";
-const char *FIRMWARE_UPDATE_KEY = "";
 const char *CONFIGURATION_SERVER_URL =  "https://irwouyd9p6.execute-api.us-east-1.amazonaws.com/pro/device_sensor_config"; // Configuration Server details
-const char *CONFIGURATION_SERVER_KEY = "";
 
 //Firmware Update Parameters
 #define DEFAULT_CHECK_FIRMWARE_UPDATE 86400000L // Check every 24 hours
@@ -101,9 +127,16 @@ RTC_DATA_ATTR unsigned long firmware_running_time;
 
 
 //Device Type ID
-const int device_type = 2; //1: Compact Weather Station; 2: Compact Weather Station Configurable; 3: EndNode Configurable
+#ifndef DEFAULT_DEVICE_TYPE
+#define DEFAULT_DEVICE_TYPE 2
+#endif
+// Compiled default. The running value comes from the backend config when present.
+int active_device_type = DEFAULT_DEVICE_TYPE;
 //Firmware version defined in platformio.ini, should be updated with every firmware change to allow for proper OTA updates
-const int firmware_version = FIRMWARE_VERSION; 
+const int firmware_version = FIRMWARE_VERSION;
+#include "ota_guard.h"
+#include "ota_verify.h"
+#include <mbedtls/sha256.h> 
 
 // Timing (Seconds)
 #define uS_TO_S_FACTOR 1000000ULL
@@ -160,13 +193,32 @@ TinyGsm modem(debugger);
 TinyGsm modem(SerialAT);
 #endif
 TinyGsmClient client(modem);
+CellularCommunicationClient cell_client;
+#ifdef FEATURE_WIFI
+WifiCommunicationClient wifi_client;
+#endif
+CommunicationManager comm;
+bool modem_was_powered = false;
+uint32_t active_sleep_sec = DEFAULT_SLEEP_SEC;
+uint8_t active_power_mode = POWER_NORMAL;
+bool announce_power_mode = false;
+int max_backlog_batches = 2;
+String configured_apn = "";
+bool configured_apn_set = false;
+RTC_DATA_ATTR uint8_t radio_skip_remaining = 0;
+RTC_DATA_ATTR uint8_t gps_fail_streak = 0;
+RTC_DATA_ATTR int saved_power_mode = POWER_NORMAL;
+float last_pack_volts = -1;
+int last_rssi = -1;
 
 // Global Flags
 bool reset_rain_sensor = false; //Flag to reset rain sensor
 
 //We only support 8 configuration for sensors
-const int namespaces_size = 8;
+extern const int namespaces_size = 8;
 String namespace_id[namespaces_size] = {"SENSOR_1", "SENSOR_2", "SENSOR_3", "SENSOR_4", "SENSOR_5", "SENSOR_6", "SENSOR_7", "SENSOR_8"};
+
+bool gps_fix_ok(float lat, float lon);
 
 // ================= FUNCTION DEFINITIONS ================= //
 
@@ -175,11 +227,11 @@ String namespace_id[namespaces_size] = {"SENSOR_1", "SENSOR_2", "SENSOR_3", "SEN
 bool publish_sensor_payload(String payload) {
     
     bool result = false;
-    if (modem.mqtt_connected()) {
+    if (comm.mqtt_connected()) {
         // If connected, send information          
         local_logger("Publish Current Data");
         String publish_topic = publish_topic_prefix + String(ESP.getEfuseMac());
-        result = modem.mqtt_publish(client_index, publish_topic.c_str(), payload.c_str());
+        result = comm.mqtt_publish(client_index, publish_topic.c_str(), payload.c_str());
         if (result) {
             local_logger("Data Published!");
             local_logger("#### Payload Sent ####");
@@ -192,18 +244,6 @@ bool publish_sensor_payload(String payload) {
 }
 
 // Initialize Peripherals
-void init_peripherals() {
-    local_logger("Initializing RS485 . . .");    
-    local_logger("RS485_EN_PIN . . .");
-    pinMode(RS485_EN_PIN, OUTPUT);
-    digitalWrite(RS485_EN_PIN, HIGH);
-
-    local_logger("PIN_5V_EN . . .");
-    pinMode(PIN_5V_EN, OUTPUT);
-    digitalWrite(PIN_5V_EN, HIGH);
-
-    local_logger("#### RS485 Init Completed ####");
-}
 
 // Initialize MQTT Connection
 bool init_mqtt_connection() {
@@ -212,11 +252,11 @@ bool init_mqtt_connection() {
     local_logger("MQTT Begin . . .");
     feed_watchdog();
     // Initialize MQTT, use SSL
-    modem.mqtt_begin(true);
+    comm.mqtt_begin(true);
 
     local_logger("MQTT Set Certificates . . .");
     // Set Amazon Certificate
-    modem.mqtt_set_certificate(AmazonRootCA, AWSClientCertificate, AWSClientPrivateKey);
+    comm.mqtt_set_certificate(AmazonRootCA, AWSClientCertificate, AWSClientPrivateKey);
     
     local_logger("MQTT Connecting . . .");
     // Connecting to AWS IOT Core
@@ -237,12 +277,12 @@ bool init_mqtt_connection() {
         if (!mqtt_connect_result) {            
             if (k == 5){
                 //Try to reset the connection
-                modem.mqtt_disconnect(client_index);
+                comm.mqtt_disconnect(client_index);
                 delay(1000);
-                modem.mqtt_end();
+                comm.mqtt_end();
                 delay(1000);
-                modem.mqtt_begin(true);
-                modem.mqtt_set_certificate(AmazonRootCA, AWSClientCertificate, AWSClientPrivateKey);
+                comm.mqtt_begin(true);
+                comm.mqtt_set_certificate(AmazonRootCA, AWSClientCertificate, AWSClientPrivateKey);
             } else {
                 delay(2000);
             }
@@ -266,10 +306,10 @@ void update_running_time() {
 // Set MQTT Subscription
 void set_mqtt_subscription() {
     // Set MQTT processing callback
-    modem.mqtt_set_callback(get_mqtt_parameters);
+    comm.mqtt_set_callback(get_mqtt_parameters);
     // Subscribe to topic
     String final_subscribe_topic = subscribe_topic_prefix + ESP.getEfuseMac();
-    if (modem.mqtt_subscribe(client_index, final_subscribe_topic.c_str())) {
+    if (comm.mqtt_subscribe(client_index, final_subscribe_topic.c_str())) {
         local_logger("Subscribed to topic: ", final_subscribe_topic);
     } else {
         local_logger("MQTT Subscribe Failed!");
@@ -277,28 +317,6 @@ void set_mqtt_subscription() {
 }
 
 // Wait for sensors to stabilize
-void wait_for_sensors(){
-    unsigned long phase_start = millis();
-    unsigned long elapsed_time = millis() - start_time;
-    unsigned long cap = TIME_TO_READ_SENSOR;
-    if (cap < TTR_SENSOR_MIN_MS) cap = TTR_SENSOR_MIN_MS;
-    if (cap > TTR_SENSOR_MAX_MS) cap = TTR_SENSOR_MAX_MS;
-    while (elapsed_time < cap) {
-        if (phase_deadline_hit(phase_start, cap + 1000UL)) {
-            local_logger("wait_for_sensors deadline");
-            break;
-        }
-        local_logger("Waiting for minimal sensor time . . .");
-        delay(1000);
-        feed_watchdog();
-        elapsed_time = millis() - start_time;
-    }
-    #ifdef DEBUG
-        local_logger("######>>>>>> Slapsed Time: ");
-        Serial.println(elapsed_time);
-    #endif
-    
-}
 
 // Restart Function
 void perform_restart() {
@@ -334,41 +352,6 @@ void perform_restart() {
 
 
 // Automatic Rain Sensor Reset Logic
-void checkAndResetRainSensor() {
-    long currentTimestampUtc = (long)get_current_timestamp();
-    if (currentTimestampUtc <= 0) {
-        return;
-    }
-
-    // Local offset stays the compiled Costa Rica value until the COUNTRY setting.
-    const long timezoneOffset = -21600;
-    long localTimestamp = currentTimestampUtc + timezoneOffset;
-    if (localTimestamp < 0) return;
-
-    long currentDayNumber = localTimestamp / 86400;
-    long secOfDay = localTimestamp % 86400;
-    const long MIDNIGHT_WINDOW_SEC = 30L * 60L;
-
-    if (lastResetDayNumber < 0) {
-        lastResetDayNumber = currentDayNumber;
-        rtc_persist_commit();
-        local_logger("Rain day initialized to ", currentDayNumber);
-        return;
-    }
-
-    if (currentDayNumber == lastResetDayNumber) return;
-
-    long previousDay = lastResetDayNumber;
-    lastResetDayNumber = currentDayNumber;
-    rtc_persist_commit();
-    // Pulse the relay only near local midnight. A later wake must not wipe the day's rain.
-    if (secOfDay >= 0 && secOfDay <= MIDNIGHT_WINDOW_SEC) {
-        reset_sensor();
-        local_logger("Rain sensor reset near local midnight. Old day ", previousDay, " new day ", currentDayNumber);
-    } else {
-        local_logger("Day changed outside the midnight window. Rain relay not pulsed.");
-    }
-}
 
 // MQTT Connect Function
 bool mqtt_connect() {
@@ -376,12 +359,12 @@ bool mqtt_connect() {
 
     String dynamic_client_id = String(client_id_prefix) + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
 
-    bool ret = modem.mqtt_connect(client_index, broker, broker_port, dynamic_client_id.c_str());
+    bool ret = comm.mqtt_connect(client_index, broker, broker_port, dynamic_client_id.c_str());
     if (!ret) {
         local_logger("Failed!"); return false;
     }
 
-    if (modem.mqtt_connected()) {
+    if (comm.mqtt_connected()) {
         local_logger("MQTT has connected!");
     } else {
         return false;
@@ -392,7 +375,7 @@ bool mqtt_connect() {
 // MQTT Disconnect Function
 void mqtt_disconnect() {
     local_logger("MQTT Disconnecting . . .");
-    modem.mqtt_disconnect(client_index);
+    comm.mqtt_disconnect(client_index);
     delay(500);
 }
 
@@ -427,6 +410,16 @@ void save_device_params() {
 
 void load_device_params() {
     if (!preferences.begin("devcfg", true)) return;
+    if (preferences.isKey("apn")) {
+        configured_apn = preferences.getString("apn", "");
+        configured_apn_set = true;
+    }
+    if (net_sticky_since == 0 && preferences.isKey("nstk")) {
+        net_sticky_since = preferences.getUInt("nstk", 0);
+    }
+    if (preferences.isKey("loglvl")) {
+        daily_log_set_level_code(preferences.getUChar("loglvl", LOG_INFO));
+    }
     if (!preferences.isKey("phash")) {
         preferences.end();
         return;
@@ -442,9 +435,32 @@ void load_device_params() {
     local_lon2 = preferences.getFloat("lon", local_lon2);
     g_rtc.param_hash = preferences.getUInt("phash", 0);
     g_rtc.last_restart_id = preferences.getUInt("rsid", 0);
+    active_device_type = preferences.getInt("dtype", active_device_type);
+    timezone_offset_sec = preferences.getInt("tz", (int)timezone_offset_sec);
+    String country = preferences.getString("ctry", "CR");
+    (void)country;
+    for (int i = 0; i < 4; i++) {
+        String key = "p" + String(i);
+        String plmn = preferences.getString(key.c_str(), "");
+        if (plmn.length() > 0 && plmn.length() < 8) {
+            strncpy(plmn_table[i], plmn.c_str(), 7);
+            plmn_table[i][7] = '\0';
+        }
+    }
     preferences.end();
     clamp_runtime_params();
     rtc_persist_commit();
+}
+
+// JSON true, or any non-zero number. as<bool>() is not enough: ArduinoJson 7
+// returns false for the 1 the backend sends.
+static bool command_flag_on(JsonVariant value) {
+    if (value.isNull()) return false;
+    const bool is_bool = value.is<bool>();
+    const bool is_number = !is_bool && !value.is<const char*>() && !value.is<JsonObject>() && !value.is<JsonArray>();
+    const bool bool_value = is_bool && value.as<bool>();
+    const long number = is_number ? value.as<long>() : 0L;
+    return flag_is_on(true, is_bool, bool_value, is_number, number);
 }
 
 // MQTT Callback to receive parameters
@@ -469,7 +485,7 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
     uint32_t hash = payload_hash32(payload, len);
     bool restart_requested = false;
     uint32_t restart_id = 0;
-    if (!parameters_payload["RESTART"].isNull() && parameters_payload["RESTART"].as<bool>()) {
+    if (command_flag_on(parameters_payload["RESTART"])) {
         if (!parameters_payload["RESTART_ID"].isNull()) {
             restart_id = parameters_payload["RESTART_ID"].as<uint32_t>();
         }
@@ -477,18 +493,27 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
         if (restart_id != g_rtc.last_restart_id) restart_requested = true;
     }
 
+    JsonVariant rr_value = parameters_payload["RR_SENSOR"];
+    const bool rr_on = command_flag_on(rr_value);
+    const bool pulse_rain = rain_pulse_due(rr_on, g_rtc.rr_prev != 0);
+
     // Retained messages (60 s) are delivered again on the next connect.
-    // Skip them when neither the body nor the restart id is new.
-    if (hash == g_rtc.param_hash && !restart_requested) {
+    // Skip them when the body and the restart id are unchanged and the rain
+    // command is not a rising edge. A repeated 1 stays quiet; 0 then 1 pulses.
+    if (hash == g_rtc.param_hash && !restart_requested && !pulse_rain) {
         parameters_payload.clear();
         return;
     }
 
-    if (!parameters_payload["RR_SENSOR"].isNull() && parameters_payload["RR_SENSOR"].as<bool>()) {
-        local_logger("Reset rain sensor command received");
-        reset_sensor();
+    if (!parameters_payload["SEND_LOGS"].isNull()) {
+        preferences.begin("devcfg", false);
+        preferences.putBool("slogs", parameters_payload["SEND_LOGS"].as<bool>());
+        preferences.end();
     }
-
+    if (!parameters_payload["LOG_LEVEL"].isNull()) {
+        String level = parameters_payload["LOG_LEVEL"].as<String>();
+        daily_log_set_level_text(level.c_str());
+    }
     if (!parameters_payload["TTS_SEC"].isNull()) {
         TIME_TO_SLEEP_SEC = clamp_i32_to_u32(parameters_payload["TTS_SEC"].as<long>(), TTS_SEC_MIN, TTS_SEC_MAX);
     }
@@ -508,7 +533,7 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
         READING_RATE = clamp_i32_to_u32(parameters_payload["R_RATE"].as<long>(), R_RATE_MIN, R_RATE_MAX);
     }
     if (!parameters_payload["G_GPS_DATA"].isNull()) {
-        get_gps_data = parameters_payload["G_GPS_DATA"].as<bool>();
+        get_gps_data = command_flag_on(parameters_payload["G_GPS_DATA"]);
     }
     if (!parameters_payload["C_F_UPDATE"].isNull()) {
         long check_ms = parameters_payload["C_F_UPDATE"].as<long>();
@@ -525,11 +550,22 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
         if (lon >= -180.0f && lon <= 180.0f) local_lon2 = lon;
     }
 
-    if (hash != g_rtc.param_hash || restart_requested) {
+    const uint8_t rr_next = rr_value.isNull() ? g_rtc.rr_prev : (uint8_t)(rr_on ? 1 : 0);
+    const bool rr_changed = g_rtc.rr_prev != rr_next;
+    g_rtc.rr_prev = rr_next;
+
+    if (hash != g_rtc.param_hash || restart_requested || rr_changed) {
         g_rtc.param_hash = hash;
         if (restart_requested) g_rtc.last_restart_id = restart_id;
         save_device_params();
         rtc_persist_commit();
+    }
+
+    // Pulse while this callback is still awake. Sleep later holds GPIO46 low,
+    // so the 5 s HIGH must finish before get_mqtt_parameters returns.
+    if (pulse_rain) {
+        local_logger("Reset rain sensor command received");
+        reset_sensor();
     }
 
     parameters_payload.clear();
@@ -547,35 +583,37 @@ JsonDocument check_firmware_update(){
     JsonDocument parameters_payload;
 
     // Initialize HTTPS
-    modem.https_begin();
+    comm.https_begin();
 
     // Set GET URT
-    if (!modem.https_set_url(CHECK_FIRMWARE_UPDATE_URL)) {
+    if (!comm.https_set_url(CHECK_FIRMWARE_UPDATE_URL)) {
         Serial.println("Failed to set the URL. Please check the validity of the URL!");
-        modem.https_end();
+        comm.https_end();
         return parameters_payload;
     } 
     // Send GET request
-    modem.https_add_header("X-API-Key", CHECK_FIRMWARE_KEY);
+    comm.https_add_header("X-API-Key", CHECK_FIRMWARE_KEY);
     int httpCode = 0;
     String post_payload = "{\"client_id\": \"";
     post_payload.concat(client_id_prefix);
     post_payload.concat("\", \"device_type\":");
-    post_payload.concat(device_type);
+    post_payload.concat(active_device_type);
+    post_payload.concat(", \"variant\":\"");
+    post_payload.concat(VARIANT_ID);
     post_payload.concat(", \"firmware_version\":");
     post_payload.concat(firmware_version);
     post_payload.concat(", \"device_id\": \"");
     post_payload.concat(ESP.getEfuseMac());
     post_payload.concat("\"}");
-    httpCode = modem.https_post(post_payload);
+    httpCode = comm.https_post(post_payload);
     if (httpCode != 200) {
         Serial.print("HTTP POST failed ! error code = "); 
         Serial.println(httpCode); 
-        modem.https_end();
+        comm.https_end();
         local_logger("HTTP get failed CHECK FIRMWARE UPDATE");
         return parameters_payload;
     }
-    String body = modem.https_body();
+    String body = comm.https_body();
     #ifdef DEBUG
         Serial.print("HTTP body : ");
         Serial.println(body);
@@ -584,52 +622,70 @@ JsonDocument check_firmware_update(){
     //Conver the String to JSON Document
     deserializeJson(parameters_payload, body);
 
-    modem.https_end();
+    comm.https_end();
 
     return parameters_payload;
 }
 
 
-// Firmware Update Function
-void firmware_update(const char *bucket_name, const char *file_name){
+// S3_CONFIG.SHA256 is lowercase hex of the image. S3_CONFIG.SIGNATURE is base64 DER ECDSA P-256.
+// Unsigned images are rejected. The signature is checked before Update.end().
+void firmware_update(const char *bucket_name, const char *file_name, const char* sha256_hex, const char* signature_b64){
+    if (!sha256_hex || !sha256_hex[0] || !signature_b64 || !signature_b64[0]) {
+        local_logger("OTA rejected. S3_CONFIG.SHA256 (hex) and S3_CONFIG.SIGNATURE (base64) are required. Unsigned images are not installed.");
+        add_sensor_error("[OTA_UNSIGNED]");
+        return;
+    }
 
     // Initialize HTTPS
-    modem.https_begin();
+    comm.https_begin();
     local_logger("Getting firmware file. . .");
 
-    String final_url = BASE_FIRMWARE_UPDATE_URL;
+    String final_url = String("https://alxv44fafe.execute-api.us-east-1.amazonaws.com/") + API_STAGE + "/";
     final_url.concat(bucket_name);
     final_url.concat("/");
     final_url.concat(file_name);
     local_logger("File Update URL: ");
     local_logger(final_url);
-    if (!modem.https_set_url(final_url)) {
+    if (!comm.https_set_url(final_url)) {
         Serial.println("Failed to set the URL. Please check the validity of the URL!");
-        modem.https_end();
+        comm.https_end();
         local_logger("Failed to set the URL. Please check the validity of the URL!");
         return;
     } 
 
     //Set API Key
-    modem.https_add_header("X-API-Key", FIRMWARE_UPDATE_KEY);
+    comm.https_add_header("X-API-Key", FIRMWARE_UPDATE_KEY);
     int httpCode = 0;
-    httpCode = modem.https_get();
+    httpCode = comm.https_get();
+    if (httpCode != 200 && strcmp(API_STAGE, "dev") != 0) {
+        comm.https_end();
+        comm.https_begin();
+        final_url = String("https://alxv44fafe.execute-api.us-east-1.amazonaws.com/dev/");
+        final_url.concat(bucket_name);
+        final_url.concat("/");
+        final_url.concat(file_name);
+        if (comm.https_set_url(final_url)) {
+            comm.https_add_header("X-API-Key", FIRMWARE_UPDATE_KEY);
+            httpCode = comm.https_get();
+        }
+    }
     if (httpCode != 200) {
         Serial.print("HTTP GET failed ! error code = "); 
         Serial.println(httpCode); 
         local_logger("HTTP GET failed ! FIRMWARE UPDATE");
-        modem.https_end();
+        comm.https_end();
         return;
     }
     local_logger("Reading firmware file. . .");
     feed_watchdog();
     unsigned long size_wait_start = millis();
-    size_t firmware_size = modem.https_get_size();
+    size_t firmware_size = comm.https_get_size();
     feed_watchdog();
     if (firmware_size == 0 || (millis() - size_wait_start) > HTTPS_SIZE_BUDGET_MS) {
         local_logger("https_get_size failed or passed its deadline");
         if (firmware_size == 0) {
-            modem.https_end();
+            comm.https_end();
             return;
         }
     }
@@ -638,6 +694,7 @@ void firmware_update(const char *bucket_name, const char *file_name){
     Serial.println("Start upgrade firmware ...");
     if (!Update.begin(firmware_size)) {
         Serial.println("Not enough space to begin OTA");
+        comm.https_end();
         return;
     }
 
@@ -645,18 +702,26 @@ void firmware_update(const char *bucket_name, const char *file_name){
     int written = 0;
     int progress = 0;
     int total = 0;
+    bool sha_ok = false;
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    sha_ok = mbedtls_sha256_starts_ret(&sha, 0) == 0;
 
     uint32_t update_timeout_start = millis();    
 
     while (total < firmware_size) {
         // Read firmware from modem buffer
-        int len = modem.https_body(buffer, 1024);
+        int len = comm.https_body(buffer, 1024);
         
         if (len > 0) {
             written = Update.write(buffer, len);
             if (written != len) {
-                Serial.println("Written only : " + String(written) + "/" + String(len));
+                mbedtls_sha256_free(&sha);
+                Update.abort();
+                comm.https_end();
+                return;
             }
+            if (!sha_ok || mbedtls_sha256_update_ret(&sha, buffer, (size_t)written) != 0) sha_ok = false;
             total += written;
             int newProgress = (total * 100) / firmware_size;
             
@@ -678,9 +743,43 @@ void firmware_update(const char *bucket_name, const char *file_name){
         }
     }
 
+    uint8_t image_hash[32];
+    memset(image_hash, 0, sizeof(image_hash));
+    if (sha_ok) sha_ok = mbedtls_sha256_finish_ret(&sha, image_hash) == 0;
+    mbedtls_sha256_free(&sha);
+
+    if ((size_t)total != firmware_size || !sha_ok) {
+        local_logger("OTA rejected. Download was incomplete or the SHA-256 could not be computed.");
+        Update.abort();
+        comm.https_end();
+        return;
+    }
+    char actual_hex[65];
+    sha256_to_hex(image_hash, actual_hex);
+    OtaPrecheck offer = ota_precheck(sha256_hex, signature_b64, actual_hex);
+    if (offer != OTA_PRECHECK_NEED_SIGNATURE) {
+        if (offer == OTA_PRECHECK_REJECT_MISSING) {
+            local_logger("OTA rejected. SHA256 or SIGNATURE is missing. Unsigned images are not installed.");
+            add_sensor_error("[OTA_UNSIGNED]");
+        } else {
+            local_logger("OTA rejected. SHA256 does not match the downloaded image.");
+            add_sensor_error("[OTA_BAD_HASH]");
+        }
+        Update.abort();
+        comm.https_end();
+        return;
+    }
+    if (!ota_signature_valid(image_hash, signature_b64)) {
+        add_sensor_error("[OTA_BAD_SIGNATURE]");
+        Update.abort();
+        comm.https_end();
+        return;
+    }
+    ota_remember_slot();
     if (!Update.end()) {
         Serial.println("Update not finished? Something went wrong!");
         Serial.println("Error Occurred. Error #: " + String(Update.getError()));
+        comm.https_end();
         return;
     }
 
@@ -694,7 +793,7 @@ void firmware_update(const char *bucket_name, const char *file_name){
 
     delay(500);
 
-    modem.https_end();
+    comm.https_end();
 
     esp_restart();    
     
@@ -723,8 +822,27 @@ void check_for_firmware_update(bool force_check) {
         bool new_firmware_available = str_param_1.toInt();
         String bucket_name = update_parameters["BUCKET_NAME"];
         String file_name = update_parameters["FILE_NAME"];
+        String offered_variant = update_parameters["VARIANT"] | update_parameters["S3_CONFIG"]["VARIANT"] | "";
+        int offered_version = update_parameters["FIRMWARE_VERSION"] | update_parameters["S3_CONFIG"]["VERSION"] | 0;
+        if (offered_variant.length() > 0 && offered_variant != VARIANT_ID) {
+            local_logger("OTA rejected. Variant does not match this build.");
+            return;
+        }
+        if (offered_version > 0 && offered_version <= firmware_version) {
+            local_logger("OTA rejected. Version is not newer.");
+            return;
+        }
 
         if (new_firmware_available) {
+            String offered_sha = update_parameters["S3_CONFIG"]["SHA256"] | "";
+            String offered_sig = update_parameters["S3_CONFIG"]["SIGNATURE"] | "";
+            offered_sha.trim();
+            offered_sig.trim();
+            if (offered_sha.length() == 0 || offered_sig.length() == 0) {
+                local_logger("OTA rejected. S3_CONFIG.SHA256 (hex) and S3_CONFIG.SIGNATURE (base64) are required. Unsigned images are not installed.");
+                add_sensor_error("[OTA_UNSIGNED]");
+                return;
+            }
             // Save the messages in RTC memory before
             spillover_rtc_to_sd();
             delay(500); // Give some time for the spillover to complete before starting the update process
@@ -733,7 +851,7 @@ void check_for_firmware_update(bool force_check) {
             local_logger("Trying to Update . . .");
             local_logger(bucket_name);
             local_logger(file_name);
-            firmware_update(bucket_name.c_str(), file_name.c_str());
+            firmware_update(bucket_name.c_str(), file_name.c_str(), offered_sha.c_str(), offered_sig.c_str());
         } else {
             local_logger("NO New Firmware!");
         }
@@ -772,1033 +890,89 @@ void go_sleep(){
         local_logger(e.what());
     }
 
+    if (!modem_was_powered) {
+        local_logger("Modem was not powered. Skipping CPOF.");
+    } else {
     #ifdef DEBUG
         Serial.println("Enter modem power off!");
     #endif
-    int i = 60;
-    while (!modem.poweroff() && i > 0) {
-        #ifdef DEBUG
-            Serial.print("Modem entering power off: ");
-            Serial.println(i);
-            Serial.println();
-        #endif
-        i--;
-        delay(500);
-    } 
-
-    #ifdef DEBUG
-        Serial.println("Waiting for modem power off");
-    #endif
+    feed_watchdog();
+    modem.poweroff();
     delay(5000);
-    int k = 50;
-    while (modem.testAT() && (k > 0)) {
-        delay(1000);
+    feed_watchdog();
+    int k = 10;
+    while (modem.testAT(500) && (k > 0)) {
+        delay(500);
         k--;
+        feed_watchdog();
     }
-    #ifdef DEBUG
-        Serial.println("Modem is not responding ,modem has power off !");        
-    #endif
+    }
 
-    //Try to low the current when deep sleep
     pinMode(PIN_5V_EN, OUTPUT);
     digitalWrite(PIN_5V_EN, LOW);
+    gpio_hold_en((gpio_num_t)PIN_5V_EN);
+    if (rtc_gpio_is_valid_gpio((gpio_num_t)PIN_5V_EN)) {
+        rtc_gpio_hold_en((gpio_num_t)PIN_5V_EN);
+    }
+
     pinMode(RS485_EN_PIN, OUTPUT);
     digitalWrite(RS485_EN_PIN, LOW);
-    
-    if (rtc_gpio_isolate((gpio_num_t)PIN_5V_EN) == ESP_OK) {
-        local_logger("PIN_5V_EN INSOLATED");
-    }
-    
- 
-    // Pull up DTR to put the modem into sleep
+    gpio_hold_en((gpio_num_t)RS485_EN_PIN);
+
+    pinMode(RESET_RAIN_SENSOR_PIN, OUTPUT);
+    digitalWrite(RESET_RAIN_SENSOR_PIN, LOW);
+    gpio_hold_en((gpio_num_t)RESET_RAIN_SENSOR_PIN);
+
+    pinMode(BOARD_SD_CS_PIN, OUTPUT);
+    digitalWrite(BOARD_SD_CS_PIN, HIGH);
+    gpio_hold_en((gpio_num_t)BOARD_SD_CS_PIN);
+
+    ledcDetachPin(LED_RED_PIN);
+    ledcDetachPin(LED_GREEN_PIN);
+    ledcDetachPin(LED_BLUE_PIN);
+
     pinMode(MODEM_DTR_PIN, OUTPUT);
     digitalWrite(MODEM_DTR_PIN, LOW);
 
-    #ifdef BOARD_POWERON_PIN
-        // Turn off DC boost to power off the modem
-        digitalWrite(BOARD_POWERON_PIN, LOW);
-        //rtc_gpio_isolate((gpio_num_t)BOARD_POWERON_PIN);
-    #endif
-
     #ifdef MODEM_RESET_PIN
-        // Keep it low during the sleep period. If the module uses GPIO5 as reset, 
-        // there will be a pulse when waking up from sleep that will cause the module to start directly.
         digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
         gpio_hold_en((gpio_num_t)MODEM_RESET_PIN);
-        gpio_deep_sleep_hold_en();
     #endif
+    gpio_deep_sleep_hold_en();
 
     #ifdef DEBUG
         Serial.println("Weather Station is going to  deep sleep!");
     #endif
 
-    
     uint32_t awake_sec = (millis() - g_wake_start_ms) / 1000UL;
-    uint32_t sleep_sec = TIME_TO_SLEEP_SEC;
+    uint32_t sleep_sec = active_sleep_sec;
     if (awake_sec + 1 < sleep_sec) sleep_sec = sleep_sec - awake_sec;
     else sleep_sec = 1;
     esp_sleep_enable_timer_wakeup((uint64_t)sleep_sec * uS_TO_S_FACTOR);
-    delay(200);    
+    delay(200);
 
     esp_deep_sleep_start();
     Serial.println("#### This will never be printed ####");
 }
 
 // Wakeup Function
-void init_modem() {
-    Serial.begin(115200); // Set console baud rate
-
-    SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
-
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
-        #ifdef DEBUG
-            Serial.println("Wakeup timer");
-            Serial.println("Turn ON Modem!");
-        #endif
-    }
-
-    // Turn on DC boost to power on the modem
-    #ifdef BOARD_POWERON_PIN
-        pinMode(BOARD_POWERON_PIN, OUTPUT);
-        digitalWrite(BOARD_POWERON_PIN, HIGH);
-    #endif
-
-    gpio_hold_dis((gpio_num_t)PIN_5V_EN);
-
-    #ifdef MODEM_RESET_PIN
-        // Release reset GPIO hold
-        gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
-
-        // Set modem reset pin ,reset modem
-        // The module will also be started during reset.
-        #ifdef DEBUG
-            Serial.println("Set Reset Pin.");
-        #endif
-        pinMode(MODEM_RESET_PIN, OUTPUT);
-        digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL); delay(100);
-        digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL); delay(2600);
-        digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
-    #endif
-
-    pinMode(MODEM_DTR_PIN, OUTPUT);
-    digitalWrite(MODEM_DTR_PIN, HIGH);
-    #ifdef DEBUG
-        Serial.println("Power on the modem PWRKEY.");
-    #endif
-    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
-    digitalWrite(BOARD_PWRKEY_PIN, LOW);
-    delay(100);
-    digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-    //Ton >= 100 <= 500
-    delay(100);
-    digitalWrite(BOARD_PWRKEY_PIN, LOW);
-
-    // Delay sometime ...
-    delay(1000);
-    #ifdef DEBUG
-        Serial.println("Checking if modem is online.");
-    #endif
-    int retry = 0;
-    int k = 50;
-    while (!modem.testAT(1000) && k > 0) {
-        k--;
-        if (retry++ > 10) {
-            digitalWrite(BOARD_PWRKEY_PIN, LOW);
-            delay(100);
-            digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-            delay(1000);
-            digitalWrite(BOARD_PWRKEY_PIN, LOW);
-            retry = 0;
-        }
-    }
-
-    //Disable WiFi
-    WiFi.mode(WIFI_OFF);
-
-    //Put the Led Pin as Output
-    pinMode(LED_RED_PIN, OUTPUT);
-    pinMode(LED_GREEN_PIN, OUTPUT);
-    pinMode(LED_BLUE_PIN, OUTPUT);
-
-    pinMode(RESET_RAIN_SENSOR_PIN, OUTPUT);
-    digitalWrite(RESET_RAIN_SENSOR_PIN, LOW);   
-
-    
-    #ifdef DEBUG
-        Serial.println("Modem is online!");
-        Serial.println("#### Wakeup Completed ####");
-    #endif
-}
 
 // Initialize Network
-bool init_network(NetworkMode mode_setup_value, bool show_status=false) {
-    unsigned long phase_start = millis();
-    // Check if SIM card is online
-    SimStatus sim = SIM_ERROR;
-    bool result = false;
-    int k = 30;
-    while ((sim != SIM_READY) && (k > 0)) {
-        if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
-            local_logger("init_network deadline");
-            return false;
-        }
-        k--;
-        sim = modem.getSimStatus();
-        switch (sim) {
-            case SIM_READY:
-                #ifdef DEBUG
-                    Serial.println("SIM card online");
-                #endif
-                break;
-            case SIM_LOCKED:
-                Serial.println("The SIM card is locked. Please unlock the SIM card first.");
-                break;
-            default:
-                break;
-        }        
-        
-        if (show_status) {
-            //The blink gives us an one second delay
-            blink_led(0, 255, 0);
-        } else {
-            delay(1000);
-        }        
-    }
-
-    if (sim != SIM_READY) {
-        if (show_status) {
-            blink_led(255, 0, 0, 10000);
-        }
-        return result;
-    }
-
-    if (!modem.setNetworkMode(mode_setup_value)) {
-        local_logger("Set network mode failed!");
-    }
-   
-    String at_response;
-    //Set APN for Global SIMs
-    #ifdef DEFAULT_NETWORK_APN
-        local_logger("Detecting SIM type via ICCID...");
-        
-        String iccid = modem.getSimCCID();
-        bool requires_apn = false; 
-        
-        if (iccid.length() > 10) { 
-            local_logger("ICCID: ", iccid);
-            
-            if (iccid.startsWith("89464")) {
-                global_apn = String(hologram_apn); 
-                requires_apn = true;
-                local_logger("SIM Detected: Hologram");
-            } 
-            else if (iccid.startsWith("89883")) {
-                global_apn = String(emnify_apn);
-                requires_apn = true;
-                local_logger("SIM Detected: Emnify");
-            } 
-            else {
-                global_apn = "local_carrier"; // Mark it for the backend
-                requires_apn = false;
-                local_logger("SIM Detected: Local Carrier");
-            }
-
-            // Only set the PDP Context if the SIM explicitly needs it
-            if (requires_apn) {
-                local_logger("Setting network APN to: ", global_apn);
-                modem.sendAT(GF("+CGDCONT=1,\"IP\",\""), global_apn, "\"");
-                
-                if (modem.waitResponse() != 1) {
-                    local_logger("Error: Failed to set APN context!");
-                    if (show_status) {
-                        blink_led(255, 0, 0, 10000);
-                    }                
-                }            
-            } else {
-                local_logger("Skipping manual APN configuration.");
-            }
-            
-        } else {
-            local_logger("Error: Failed to read ICCID or SIM missing.");
-            if (show_status) {
-                blink_led(255, 0, 0, 10000);
-            }
-        } 
-    #endif
-
-    // ==========================================================
-    // NUEVA LÓGICA DE ROTACIÓN DE RED (ANTI-ZOMBIE)
-    // ==========================================================
-    if (consecutive_network_changes >= MAX_NETWORK_FAILURES) {
-        current_network_index++; // Try next network option
-        if (current_network_index > 3) {
-            current_network_index = 0; // Back to automatic mode after trying all options
-        }
-        // Reset the counter after a network change to give it a fresh start
-        consecutive_network_changes = 0; 
-        local_logger("Fallos maximos alcanzados. Cambiando red a indice: ", current_network_index);
-    }
-
-    if (current_network_index == 0 || global_apn == "local_carrier") {
-        local_logger("Red en modo Automatico (+COPS=0)");
-        modem.sendAT(GF("+COPS=0")); // Automatic mode
-        modem.waitResponse(10000L, at_response);
-        local_logger("Registro automático: ", at_response);
-    } else {
-        String plmn = CR_NETWORKS[current_network_index];
-        local_logger("Forzando red manual (+COPS=1,2): ", plmn);
-        
-        // A. Forzamos el desregistro primero (Limpiar caché de la red zombie)
-        modem.sendAT(GF("+COPS=2"));
-        modem.waitResponse(5000L, at_response);
-        local_logger("Desregistro forzado: ", at_response);
-        
-        // B. Intentamos el registro manual usando el código PLMN
-        modem.sendAT(GF("+COPS=1,2,\""), plmn, GF("\",7"));
-        // C. Importante: La búsqueda manual toma tiempo. Le damos hasta 30 segundos.
-        modem.waitResponse(30000L, at_response); 
-        local_logger("Registro manual: ", at_response);
-    }
-    // ==========================================================
-
-    // Check network registration status and network signal status
-    int16_t sq ;
-    #ifdef DEBUG
-        Serial.println("Wait for the modem to register with the network.");
-    #endif
-    RegStatus status = REG_NO_RESULT;
-    k = 60;
-    while ((status == REG_NO_RESULT || status == REG_SEARCHING || status == REG_UNREGISTERED) && (k > 0)) {
-        if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
-            local_logger("init_network deadline");
-            return false;
-        }
-        k--;
-        status = modem.getRegistrationStatus();
-        switch (status) {
-            case REG_UNREGISTERED:
-                local_logger("REG_UNREGISTERED . . .");
-                if (show_status) {
-                    blink_led(0, 255, 0);
-                } else {
-                    delay(1000);
-                }
-                break;
-            case REG_SEARCHING:
-                #ifdef DEBUG
-                    sq = modem.getSignalQuality();
-                    local_logger("Signal Quality: ", sq);
-                #endif
-                if (show_status) {
-                    blink_led(0, 255, 0);
-                } else {
-                    delay(1000);
-                } 
-                break;
-            case REG_EMERGENCY:
-                local_logger("Attached for emergency bearer services only");
-                if (show_status) {
-                    blink_led(0, 255, 0);
-                }                
-                break;
-            case REG_DENIED:
-                local_logger("Network registration was rejected, please check if the APN is correct");
-                return false;
-            case REG_OK_HOME:
-                local_logger("Online registration successful");                
-                break;
-            case REG_OK_ROAMING:
-                local_logger("Network registration successful, currently in roaming mode");
-                break;
-            default:
-                local_logger("Registration Status: ", status);
-                if (show_status) {
-                    blink_led(0, 255, 0);
-                } else {
-                    delay(1000);
-                }
-                break;
-        }
-    }
-
-    if (status == REG_NO_RESULT || status == REG_SEARCHING || status == REG_UNREGISTERED) {
-        local_logger("REGISTRATION FAILED!");
-        if (show_status) {
-            blink_led(255, 0, 0, 10000);
-        }
-        // If registration failed restart the modem and try again later
-        modem.restart();
-        return result;
-    }
-
-    local_logger("Registration Status: ", status);
-    if (show_status) {
-        blink_led(0, 255, 0);
-    }                
-
-    //For Roaming Enabling the network din't work. We use wait for network
-    bool enable_network = false;
-    String ipAddress = "";
-    if (status != REG_OK_ROAMING && status != REG_EMERGENCY) {
-        k = 60;
-        enable_network = modem.enableNetwork();
-        while (!enable_network && k > 0) {
-            if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
-                local_logger("init_network deadline");
-                return false;
-            }
-            enable_network = modem.enableNetwork();
-            local_logger("Trying to enable network: ", k); 
-            if (show_status) {
-                blink_led(0, 255, 0);
-            } 
-            k--;
-        }
-        if (enable_network) {  
-            local_logger("GET IP:");
-            ipAddress = modem.getLocalIP();
-            ipAddress.trim();
-            #ifdef DEBUG
-                if (ipAddress.isEmpty()) {
-                    local_logger("IP EMPTY . . .");                    
-                    delay(1000);
-                }           
-            #endif
-        }
-        if (show_status) {
-            blink_led(0, 255, 0);
-        } 
-    } else {
-        local_logger("TRY TO ENABLE NETWORK: ");
-        k = 10;          
-        while (ipAddress.isEmpty() && k > 0) {
-            if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
-                local_logger("init_network deadline");
-                return false;
-            }
-            k--;
-            #ifdef DEBUG
-                Serial.println("");
-                Serial.println("################################################################");
-                Serial.print("TRY NUMBER: ");
-                Serial.println(k);            
-            #endif                        
-            int p = 5;
-            bool enable_network = modem.enableNetwork();
-            while (!enable_network && p > 0) {
-                if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
-                    local_logger("init_network deadline");
-                    return false;
-                }
-                p--;
-                #ifdef DEBUG
-                    Serial.println("");
-                    Serial.println(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");                
-                    Serial.println("");
-                    Serial.print("Trying to enable network:");
-                    Serial.println(p);
-                    Serial.println("");
-                #endif                
-                enable_network = modem.enableNetwork();
-                Serial.println("");
-                delay(1000);                
-            }
-            if (enable_network) {  
-                #ifdef DEBUG
-                    Serial.println("");         
-                    Serial.println("//////////////////////////////////////////////////////////////////");     
-                    Serial.println("GET IP:");
-                #endif
-                ipAddress = modem.getLocalIP();
-                ipAddress.trim();
-                #ifdef DEBUG
-                    if (ipAddress.isEmpty()) {
-                        Serial.println("IP EMPTY . . .");                    
-                        delay(1000);
-                    }           
-                #endif
-            }
-            if (show_status) {
-                blink_led(0, 255, 0);
-            }
-        }    
-    }
-
-    result = !ipAddress.isEmpty();
-
-    #ifdef DEBUG
-        if (result) {
-            modem.sendAT(GF("+CNUM"));
-            if (modem.waitResponse(3000, at_response) != 1) {
-                Serial.println("Read Phone Number Failed!");        
-            }  else {
-                Serial.print("RESPONSE CNUM: ");
-                at_response.replace("AT+CNUM", "");  
-                at_response.replace("+CNUM:", "");            
-                at_response.replace(GSM_NL "OK" GSM_NL, "");
-                at_response.replace(GSM_NL, "");
-                at_response.trim();        
-                Serial.println(at_response);        
-            }
-            Serial.print("Network IP:"); 
-            Serial.println(ipAddress);    
-            Serial.println("OPERATOR: ");
-            Serial.print(modem.getOperator());
-            delay(1000);
-        } else {
-            Serial.println("NETWORK ACTIVATION FAILED!!!");
-            delay(5000);
-        }
-    #endif
-    
-    if (!result && show_status){
-        blink_led(255, 0, 0, 10000);
-    } 
-
-    #ifdef DEBUG
-        // MODO DEBUG: Forzamos la rotación de red en cada reinicio/ejecución
-        current_network_index++;
-        if (current_network_index > 3) {
-            current_network_index = 0;
-        }
-        local_logger("DEBUG MODE: Forzando cambio manual de red a indice: ", current_network_index);        
-    #endif
-
-
-    return result;    
-}
 
 // Get Sensor Payload
 // NUEVO: Se agregó el parámetro 'String value_types[]'
-String get_sensor_payload(String sensor_id, int baud_rate, int sensor_address, int start_holding_register, int registers_to_read, String value_names[], String value_types[], int value_names_size, bool has_types) {
-
-    uint32_t j; 
-    uint8_t result;
-    ModbusMaster end_node;
-    JsonDocument doc;
-    String return_value = "{\"sensor\": -1}";
-
-    Serial485.begin(baud_rate, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-    delay(50);
-    end_node.begin(sensor_address, Serial485);
-    delay(500);
-
-    result = end_node.readHoldingRegisters(start_holding_register, registers_to_read);
-    
-    if (result == end_node.ku8MBSuccess) {        
-        
-        int buffer_index = 0; // Índice independiente para la memoria Modbus
-
-        for (j = 0; j < value_names_size; j++) {
-            String current_name = value_names[j];
-            
-            // Lógica por defecto: Si no hay tipos declarados, asumimos INTEGER
-            String current_type = "INTEGER"; 
-            if (has_types) {
-                current_type = value_types[j];
-            }
-
-            // Procesamiento según el tipo
-            if (current_type == "FLOAT32_ABCD" || current_type == "FLOAT32_CDAB") {
-                
-                uint16_t word1 = end_node.getResponseBuffer(buffer_index);
-                uint16_t word2 = end_node.getResponseBuffer(buffer_index + 1);
-                
-                
-                uint32_t combined_bits = 0;
-                
-                // Aplicamos el clásico "Word Swap" y corrimiento de bits
-                if (current_type == "FLOAT32_CDAB") {
-                    combined_bits = ((uint32_t)word2 << 16) | word1; 
-                } else { // FLOAT32_ABCD
-                    combined_bits = ((uint32_t)word1 << 16) | word2;
-                }
-                
-                // La técnica definitiva a prueba de compiladores (Strict Aliasing)
-                float float_result = 0.9f;
-                memcpy(&float_result, &combined_bits, sizeof(float_result));
-
-                doc[current_name] = float_result;
-                buffer_index += 2; // Consumimos 2 registros (32 bits)
-
-            } else {
-                // Caso "INTEGER" o cualquier otro valor no reconocido (Fallback de seguridad)
-                uint16_t raw_value = end_node.getResponseBuffer(buffer_index);
-                doc[current_name] = raw_value;
-                buffer_index += 1; // Consumimos 1 registro (16 bits)
-            }
-        }
-    } else {
-        Serial.println("########### Sensor RS485 Read Failed ###########");
-        doc["err"] = "ERROR";
-        doc["res"] = result;
-        doc["addr"] = sensor_address;
-        doc["reg"] = start_holding_register;
-        doc["len"] = registers_to_read;
-        doc["baud"] = baud_rate;
-        doc["sz"] = value_names_size;
-        doc["id"] = sensor_id;
-        doc["val"] = value_names[0];        
-    }
-    
-    serializeJson(doc, return_value);
-
-    end_node.clearResponseBuffer();
-    end_node.clearTransmitBuffer();
-    delay(50);
-    Serial485.flush();
-    delay(50);
-    Serial485.end();
-    delay(50);
-
-    return return_value;
-}
 
 // Get Sensor Configuration from Server
-bool get_sensor_configuration(bool show_status=false) {
 
-    JsonDocument parameters_payload;
-    String device_id = String(ESP.getEfuseMac());
-
-    // Initialize HTTPS
-    if (show_status) {
-        blink_led(255,255,255, 500);
-        modem.https_begin();
-        blink_led(255,255,255, 500);
-    } else {
-        modem.https_begin();
-    }
-
-
-    // Set GET URT
-    if (!modem.https_set_url(CONFIGURATION_SERVER_URL)) {
-        Serial.println("Failed to set the URL. Please check the validity of the URL!");
-        modem.https_end();
-        if (show_status) {
-            blink_led(255,0,0,10000);
-        }        
-        return false;
-    }
-    if (show_status) {
-        blink_led(255,255,255,500);
-    }
-
-    // Send POST request
-    modem.https_add_header("X-API-Key", CONFIGURATION_SERVER_KEY);
-    int httpCode = 0;
-    String post_payload = "{\"device_type\": ";
-    post_payload.concat(device_type);
-    post_payload.concat(", \"device_id\": \"");
-    post_payload.concat(device_id);
-    post_payload.concat("\"}");
-    httpCode = modem.https_post(post_payload);
-    if (show_status) {
-        blink_led(255,255,255,500);
-    }
-    if (httpCode != 200) {
-        Serial.print("HTTP get failed ! error code = "); 
-        Serial.println(httpCode);         
-        modem.https_end();
-        local_logger("HTTP get failed GET UPDATE PARAMETERS");
-        if (show_status) {
-            blink_led(255,0,0,10000);
-        }
-        return false;
-    }
-
-    if (show_status) {
-        blink_led(255,255,255,500);
-    }
-    String body = modem.https_body();
-    if (show_status) {
-        blink_led(255,255,255,500);
-    }
-    #ifdef DEBUG
-        Serial.print("HTTP body : ");
-        Serial.println(body);
-        delay(5000);
-    #endif
-
-    //Conver the String to JSON Document
-    deserializeJson(parameters_payload, body);
-    if (show_status) {
-        blink_led(255,255,255,500);
-    }
-    #ifdef DEBUG
-        String str_sensors = parameters_payload["sensors"];
-        Serial.println("SENSORS CONFIGURATION: ");
-        Serial.println(str_sensors);
-        delay(2000);
-    #endif
-    JsonArray sensors = parameters_payload["sensors"];
-    if (sensors.isNull() || sensors.size() <= 0 || sensors.size() > (size_t)namespaces_size) {
-        modem.https_end();
-        if (show_status) {
-            blink_led(255,0,0,10000);
-        }
-        return false;
-    }
-
-    struct PendingSensor {
-        String sensor_id;
-        int is_async;
-        int trig_reg;
-        int trig_val;
-        int stat_reg;
-        int ready_val;
-        int warmup_val;
-        uint32_t max_wait_ms;
-        int address;
-        int start_reg;
-        int regs;
-        int baud;
-        String value_names;
-        String value_types;
-        bool has_types;
-    };
-
-    PendingSensor pending[8];
-    int pending_count = 0;
-    bool config_valid = true;
-    for (JsonVariant sensor_config : sensors) {
-        if (pending_count >= namespaces_size) {
-            config_valid = false;
-            break;
-        }
-        PendingSensor& item = pending[pending_count];
-        item.sensor_id = sensor_config["SENSOR_ID"].as<String>();
-        item.sensor_id.trim();
-        item.is_async = sensor_config["IS_ASYNC"] | 0;
-        if (item.is_async != 0 && item.is_async != 1) item.is_async = 0;
-        item.address = sensor_config["SENSOR_ADDRESS"] | 0;
-        item.start_reg = sensor_config["START_HOLDING_REGISTER"] | 0;
-        item.regs = sensor_config["REGISTERS_TO_READ"] | 0;
-        item.baud = sensor_config["BAUD_RATE"] | 9600;
-        item.value_names = sensor_config["VALUE_NAMES"].as<String>();
-        item.has_types = sensor_config["VALUE_TYPES"].is<String>();
-        item.value_types = item.has_types ? sensor_config["VALUE_TYPES"].as<String>() : String("");
-        item.trig_reg = sensor_config["TRIG_REG"] | 0;
-        item.trig_val = sensor_config["TRIG_VAL"] | 1;
-        item.stat_reg = sensor_config["STAT_REG"] | 1;
-        item.ready_val = sensor_config["READY_VAL"] | 3;
-        item.warmup_val = sensor_config["WARMUP_VAL"] | 1;
-        item.max_wait_ms = sensor_config["MAX_WAIT_MS"] | 60000;
-        if (item.max_wait_ms < 1000) item.max_wait_ms = 1000;
-        if (item.max_wait_ms > 180000) item.max_wait_ms = 180000;
-
-        char name_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
-        bool names_truncated = false;
-        int name_count = csv_parse_tokens(item.value_names.c_str(), name_tokens, CSV_MAX_TOKENS, &names_truncated);
-        bool types_ok = true;
-        if (item.has_types) {
-            char type_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
-            bool types_truncated = false;
-            int type_count = csv_parse_tokens(item.value_types.c_str(), type_tokens, CSV_MAX_TOKENS, &types_truncated);
-            types_ok = !types_truncated && type_count == name_count;
-        }
-        if (item.sensor_id.length() == 0 || item.sensor_id.length() > 32
-            || item.address < 1 || item.address > 247
-            || item.start_reg < 0 || item.start_reg > 65535
-            || item.regs < 1 || item.regs > 32
-            || item.baud < 1200 || item.baud > 115200
-            || name_count < 1 || names_truncated || !types_ok) {
-            config_valid = false;
-            break;
-        }
-        pending_count++;
-        feed_watchdog();
-    }
-
-    if (!config_valid || pending_count == 0) {
-        local_logger("Sensor config rejected. Previous configuration kept.");
-        parameters_payload.clear();
-        modem.https_end();
-        if (show_status) blink_led(255, 0, 0, 10000);
-        return false;
-    }
-
-    // Swap only after the whole document validated.
-    has_async_sensors = false;
-    for (int i = 0; i < namespaces_size; i++) {
-        preferences.begin(namespace_id[i].c_str(), false);
-        preferences.clear();
-        if (i < pending_count) {
-            PendingSensor& item = pending[i];
-            preferences.putString("SENSOR_ID", item.sensor_id);
-            preferences.putInt("IS_ASYNC", item.is_async);
-            if (item.is_async == 1) {
-                has_async_sensors = true;
-                preferences.putInt("TRIG_REG", item.trig_reg);
-                preferences.putInt("TRIG_VAL", item.trig_val);
-                preferences.putInt("STAT_REG", item.stat_reg);
-                preferences.putInt("READY_VAL", item.ready_val);
-                preferences.putInt("WARMUP_VAL", item.warmup_val);
-                preferences.putUInt("MAX_WAIT_MS", item.max_wait_ms);
-            }
-            preferences.putInt("SENSOR_ADDRESS", item.address);
-            preferences.putInt("START_HOLD_REG", item.start_reg);
-            preferences.putInt("REGS_TO_READ", item.regs);
-            preferences.putInt("BAUD_RATE", item.baud);
-            preferences.putString("VALUE_NAMES", item.value_names);
-            if (item.has_types) preferences.putString("VALUE_TYPES", item.value_types);
-        }
-        preferences.end();
-        feed_watchdog();
-        if (show_status) blink_led(255, 255, 255, 500);
-    }
-
-    parameters_payload.clear();
-    modem.https_end();
-    if (show_status) {
-        blink_led(255,255,255,500);
-    }
-    return true;
-}
-
-bool sensor_config_present() {
-    for (int i = 0; i < namespaces_size; i++) {
-        preferences.begin(namespace_id[i].c_str(), true);
-        bool present = preferences.isKey("SENSOR_ID");
-        preferences.end();
-        if (present) return true;
-    }
-    return false;
-}
 
 // Clear Sensors Configuration from Preferences
-void clear_sensors_configuration() {
-    for (int i=0;i<namespaces_size;i++) {
-        #ifdef DEBUG
-            Serial.println("CLEAR NAMESPACE:");            
-            Serial.println(namespace_id[i].c_str());
-            delay(500);
-        #endif
-        preferences.begin(namespace_id[i].c_str());
-        if (preferences.isKey("SENSOR_ID")) {
-            preferences.remove("SENSOR_ID");
-        }
-        preferences.clear();
-        preferences.end();
-    }
-}
 
 
 // Prepare Async Sensors: Trigger and Wait for Ready
-void prepare_async_sensors() {
-
-    if (!has_async_sensors) {        
-        local_logger("Skipping async preparation. No async sensors configured.");
-        return; 
-    }
-
-    uint32_t max_wait_required = 0;
-    bool waiting_needed = false;
-
-    // Check if we have async sensors and trigger them, also calculate the max wait time required
-    for (int i = 0; i < namespaces_size; i++) {
-        preferences.begin(namespace_id[i].c_str(), true); // Solo lectura
-        
-        // Check if the sensor configuration exists and is marked as async
-        if (preferences.getInt("IS_ASYNC", 0) == 1) {
-            int baud      = preferences.getInt("BAUD_RATE", 9600);
-            int addr      = preferences.getInt("SENSOR_ADDRESS", 9);
-            int trig_reg  = preferences.getInt("TRIG_REG", 0);
-            int trig_val  = preferences.getInt("TRIG_VAL", 1);
-            int stat_reg  = preferences.getInt("STAT_REG", 1);
-            int warmup_val = preferences.getInt("WARMUP_VAL", 2);
-            int ready_val = preferences.getInt("READY_VAL", 3);
-            uint32_t wait = preferences.getUInt("MAX_WAIT_MS", 68000);
-
-            // Bus control
-            Serial485.begin(baud, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-            delay(50);
-            ModbusMaster end_node;
-            end_node.begin(addr, Serial485);
-            delay(500);
-
-            // CONSULTA DE ESTADO
-            uint8_t result = end_node.readHoldingRegisters(stat_reg, 1);
-            if (result == end_node.ku8MBSuccess) {
-                int status = end_node.getResponseBuffer(0);
-                if (status < warmup_val) {
-                    // Trigger the sensor to start the measurement(Warm/Stabilization)
-                    add_sensor_error("[TRIG_REG]:[" + String(trig_reg) + "]");
-                    add_sensor_error("[TRIG_VAL]:[" + String(trig_val) + "]");
-                    uint8_t write_res = end_node.writeSingleRegister(trig_reg, trig_val);                    
-                    if (write_res != end_node.ku8MBSuccess) {
-                        add_sensor_error("[ASYNC_TRIG_FAIL]:[" + String(write_res) + "]");
-                    } else {
-                        add_sensor_error("[ASYNC_TRIG_OK]");
-                    }
-                    waiting_needed = true;
-                    if (wait > max_wait_required) max_wait_required = wait;
-                } else if (status == warmup_val) {
-                    // Sensor is stabilizing waiting is needed
-                    waiting_needed = true;
-                    if (wait > max_wait_required) max_wait_required = wait;
-                } 
-                add_sensor_error("[ASYNC_WAITING_NEEDED]:[" + String(waiting_needed) + "]");
-                add_sensor_error("[ASYNC_WAITING_VALUE]:[" + String(max_wait_required) + "]");
-                add_sensor_error("[ASYNC_STATUS]:[" + String(status) + "]");
-            } else {
-                local_logger("Fallo al leer estado del sensor:", namespace_id[i].c_str());
-                add_sensor_error("[ASYNC_GET_STATE_ERROR]:[" + String(result) + "]");
-            }
-            
-            end_node.clearResponseBuffer();
-            end_node.clearTransmitBuffer();
-            Serial485.flush();
-            delay(50);
-            Serial485.end();
-            delay(100);
-        }
-        preferences.end();
-        delay(100);
-    }
-
-    // Active wait and check if sensors are ready before read them
-    bool all_ready = false;
-    int status = 0;
-    if (waiting_needed) {
-        uint32_t l_start_time = millis();        
-
-        while ((millis() - l_start_time) < max_wait_required && !all_ready) {
-            feed_watchdog();
-            delay(3000);
-
-            all_ready = true;
-            for (int i = 0; i < namespaces_size; i++) {
-                preferences.begin(namespace_id[i].c_str(), true);
-                if (preferences.getInt("IS_ASYNC", 0) == 1) {
-                    int baud      = preferences.getInt("BAUD_RATE", 9600);
-                    int addr      = preferences.getInt("SENSOR_ADDRESS", 9);
-                    int stat_reg  = preferences.getInt("STAT_REG", 1);
-                    int ready_val = preferences.getInt("READY_VAL", 3);
-
-                    Serial485.begin(baud, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-                    delay(50);
-                    ModbusMaster end_node;
-                    end_node.begin(addr, Serial485);
-                    delay(500);
-
-                    uint8_t result = end_node.readHoldingRegisters(stat_reg, 1);
-                    if (result == end_node.ku8MBSuccess) {
-                        status = end_node.getResponseBuffer(0);
-                        if (status != ready_val) {
-                            all_ready = false;
-                        } else{
-                            add_sensor_error("[ASYNC_SENSOR_READY]:[" + String(status) + "]");
-                        }
-                    } else {
-                        local_logger("Fallo al leer estado del sensor durante la espera:", namespace_id[i].c_str());
-                        add_sensor_error("[ASYNC_STATE_ERROR_WAITING]:[" + String(result) + "]");
-                        all_ready = false;
-                    }
-
-                    end_node.clearResponseBuffer();
-                    end_node.clearTransmitBuffer();
-                    Serial485.flush();
-                    delay(50);
-                    Serial485.end();
-                    delay(100);
-                }
-                preferences.end();
-            }
-        }
-    }
-    if (waiting_needed && !all_ready) {
-        local_logger("TIMEOUT CRÍTICO: El sensor no alcanzó el estado de Listo.");
-        add_sensor_error("[ASYNC_TIMEOUT]");
-        add_sensor_error("[ASYNC_LAST_STATUS]:[" + String(status) + "]");        
-    }    
-}
 
 // Get Final Sensor Payload
-String get_final_sensor_payload(){
 
-    JsonDocument doc;
-    String final_sensor_payload;
-    
-    unsigned int rate = READING_RATE;
-    if (rate < R_RATE_MIN) rate = R_RATE_MIN;
-    if (rate > R_RATE_MAX) rate = R_RATE_MAX;
-    for (unsigned int k = 0; k < rate; k++) {
-        for (int i=0;i<namespaces_size;i++) {
-            #ifdef DEBUG
-                Serial.println(". . . get_final_sensor_payload . . .");
-                Serial.println("NAMESPACE: ");
-                Serial.println(namespace_id[i].c_str());
-                delay(100);
-            #endif
-            preferences.begin(namespace_id[i].c_str(), true);
-            
-            if (preferences.isKey("SENSOR_ID")) {
-                String sensor_id = preferences.getString("SENSOR_ID");
-                int sensor_address = preferences.getInt("SENSOR_ADDRESS");
-                int baud_rate = preferences.getInt("BAUD_RATE");
-                if (baud_rate == 0) {
-                    baud_rate = DEFAULT_BAUD_RATE;
-                }
-                int start_holding_register = preferences.getInt("START_HOLD_REG");
-                int registers_to_read = preferences.getInt("REGS_TO_READ");
-                
-                String str_value_names = preferences.getString("VALUE_NAMES");
-                String str_value_types = preferences.getString("VALUE_TYPES", "");
-                
-                #ifdef DEBUG
-                    Serial.println("VALUE_NAMES: ");
-                    Serial.println(str_value_names);
-                    Serial.println("VALUE_TYPES: ");
-                    Serial.println(str_value_types);            
-                    delay(100);
-                #endif
-                
-                char name_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
-                char type_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
-                bool names_truncated = false;
-                bool types_truncated = false;
-                int value_names_size = csv_parse_tokens(str_value_names.c_str(), name_tokens, CSV_MAX_TOKENS, &names_truncated);
-                int value_types_size = 0;
-                if (str_value_types.length() > 0) {
-                    value_types_size = csv_parse_tokens(str_value_types.c_str(), type_tokens, CSV_MAX_TOKENS, &types_truncated);
-                }
-                if (names_truncated || types_truncated) {
-                    add_sensor_error("[CSV_TRUNC]");
-                }
-                String value_names[CSV_MAX_TOKENS];
-                String value_types[CSV_MAX_TOKENS];
-                for (int t = 0; t < value_names_size; t++) value_names[t] = name_tokens[t];
-                bool has_types = value_types_size > 0;
-                for (int t = 0; t < CSV_MAX_TOKENS; t++) {
-                    value_types[t] = (t < value_types_size) ? String(type_tokens[t]) : String("INTEGER");
-                }
-
-                // Llamada al método con la bandera has_types
-                String sensor_payload = get_sensor_payload(sensor_id, baud_rate, sensor_address, start_holding_register, registers_to_read, value_names, value_types, value_names_size, has_types);
-                
-                String str_sensor_id = sensor_id + "_";
-                str_sensor_id.concat(k);
-                doc[str_sensor_id] = serialized(sensor_payload);
-                
-                delay(250);
-            }
-            preferences.end();                        
-        }
-        unsigned long gap_sec = TIME_BETWEEN_READINGS;
-        if (gap_sec > TB_READINGS_MAX_SEC) gap_sec = TB_READINGS_MAX_SEC;
-        for (unsigned long sec = 0; sec < gap_sec; sec++) {
-            delay(1000);
-            feed_watchdog();
-        }
-    }
-
-    serializeJson(doc, final_sensor_payload);
-
-    local_logger("Final Sensor Payload: ");
-    local_logger(final_sensor_payload);
-
-    return final_sensor_payload;
-}
+void attach_daily_health(JsonDocument& doc);
 
 // Get Final Payload
 String get_final_payload(String sensors_payload, String gps_payload, bool result) {
@@ -1812,11 +986,11 @@ String get_final_payload(String sensors_payload, String gps_payload, bool result
     if (sensors_payload == "" || sensors_payload == "null" || sensors_payload == "{}") {
         consecutive_null_errors++;
         rtc_persist_commit();
-        local_logger("ERROR CRITICO: Payload de sensores nulo. Se encola un registro de error.");
+        local_logger("Critical error: null sensor payload. Queueing an error record.");
         add_sensor_error("[NULL_PAYLOAD_ERROR]");
         sensors_payload = "{\"err\":\"NULL_PAYLOAD\",\"n\":" + String((int)consecutive_null_errors) + "}";
     } else if (consecutive_null_errors > 0) {
-        local_logger("Sensores recuperados. Limpiando contador de fallos RTC a 0.");
+        local_logger("Sensors recovered. Cleared the RTC failure counter.");
         consecutive_null_errors = 0;
         rtc_persist_commit();
     }
@@ -1826,10 +1000,18 @@ String get_final_payload(String sensors_payload, String gps_payload, bool result
 
     doc["fv"] = firmware_version;
     doc["uid"] = String(ESP.getEfuseMac());
-    doc["dt"] = String(device_type);
-    doc["net"] = global_apn;
+    doc["dt"] = String(active_device_type);
+    doc["net"] = registered_plmn;
+    doc["sim"] = sim_label;
     doc["ts"] = (int)current_time_source;
     doc["tm"] = final_timestamp;
+    doc["eff_sleep"] = active_sleep_sec;
+    doc["power_mode"] = active_power_mode;
+    doc["next_msg_at"] = (long)final_timestamp + (long)active_sleep_sec;
+    if (announce_power_mode) {
+        doc["evt"] = "MODE_CHANGE";
+        doc["pack_v"] = last_pack_volts;
+    }
 
     if (!is_sdcard_ok) {
         doc["sd_st"] = false;
@@ -1853,7 +1035,7 @@ String get_final_payload(String sensors_payload, String gps_payload, bool result
         doc["rst_err"] = reset_errors;
         rtc_error_ring_clear();
     }
-    // ==========================================
+    attach_daily_health(doc);
 
     serializeJson(doc, final_payload);
 
@@ -1863,158 +1045,8 @@ String get_final_payload(String sensors_payload, String gps_payload, bool result
 }
 
 // Get GPS Payload
-String get_gps_position(bool show_status=false) {
-
-    String gps_payload = "{\"fix\":-1, \"lat\": -1, \"lon\": -1, \"spd\": -1, \"alt\": -1, \"vsat\": -1, \"usat\": -1, \"acc\": -1, \"yr\": 2000, \"mo\": 1, \"dy\": 1, \"hr\": 0, \"mi\": 0, \"sc\": 0, \"src\": \"Error\"}";
-
-    float lat2      = -1;
-    float lon2      = -1;
-    float speed2    = 0;
-    float alt2      = 0;
-    int   vsat2     = 0;
-    int   usat2     = 0;
-    float accuracy2 = 0;
-    int   year2     = 0;
-    int   month2    = 0;
-    int   day2      = 0;
-    int   hour2     = 0;
-    int   min2      = 0;
-    int   sec2      = 0;
-    uint8_t fixMode = 0;    
-
-    
-    local_logger("Enabling GPS/GNSS/GLONASS");
-    bool got_gps_data = false;
-    int i = 10;
-    bool enabled_gps = false;
-    while (!enabled_gps && (i > 0)) {
-        enabled_gps = modem.enableGPS(MODEM_GPS_ENABLE_GPIO);
-        if (!enabled_gps) {
-            local_logger(".");
-            i--;
-            if (show_status) {
-                blink_led(0,0,255, 300);
-            } else {
-                delay(1000);
-            }            
-        }
-    }
-
-    if (!enabled_gps) {
-        local_logger("GPS Enabling Failed!");
-    } else {
-        local_logger("GPS Enabled");
-        // Set GPS Baud to 115200
-        modem.setGPSBaud(115200);        
-        //The first time we need half minute at least to get a position.
-        for (int j=0;j<30;j++) {
-            if (show_status) {
-                blink_led(0,0,255);
-            } else {
-                delay(1000);
-            }            
-        }
-        i = 60;
-        while (i > 0) {
-            local_logger("Requesting current GPS/GNSS/GLONASS location");
-            got_gps_data = modem.getGPS(&fixMode, &lat2, &lon2, &speed2, &alt2, &vsat2, &usat2, &accuracy2,
-                            &year2, &month2, &day2, &hour2, &min2, &sec2);                
-            if (got_gps_data) {
-                gps_payload = "{";
-                gps_payload.concat("\"lat\":"); 
-                gps_payload += String(lat2, 5);
-                gps_payload.concat(",");
-                gps_payload.concat("\"lon\":");                 
-                gps_payload += String(lon2, 5);
-                gps_payload.concat(",");
-                gps_payload.concat("\"src\":"); 
-                gps_payload.concat("\"GPS\"");
-                gps_payload.concat("}");                
-                break;
-            } else {
-                local_logger("Couldn't get GPS/GNSS/GLONASS location, retrying in 1s.: ", i);
-                i--;
-                if (show_status) {
-                    blink_led(0,0,255);
-                } else {
-                    delay(1000);
-                }                
-            }
-        }            
-    }    
-    Serial.println("DISABLE GPS . . .");
-    modem.disableGPS();
-    if (lat2 >= 8 && lat2 <= 11.5 && lon2 >= 82 && lon2 <= 86){
-        //Si los datos están en los rangos normales para Costa Rica ya no los buscamos más.            
-        #ifdef DEBUG
-            local_logger("GET a Long and Lat. . .");
-            Serial.println("LONG: ");
-            Serial.println(lon2);
-            Serial.println("LAT: ");
-            Serial.println(lat2);
-        #endif
-        get_gps_data = false;
-        local_lat2 = lat2;
-        local_lon2 = lon2;
-        if (show_status) {
-            blink_led(0,255,0);
-        }
-    } else {
-        //If we don't get GPS data in the correct range, we decide to use a fix value
-        get_gps_data = false;
-        if (!get_gps_data && local_lat2 >= 8 && local_lat2 <= 11.5 && local_lon2 >= 82 && local_lon2 <= 86) {
-            gps_payload = "{";
-            gps_payload.concat("\"lat\":"); 
-            gps_payload += String(local_lat2, 5);
-            gps_payload.concat(",");
-            gps_payload.concat("\"lon\":"); 
-            gps_payload += String(local_lon2, 5);
-            gps_payload.concat(",");
-            gps_payload.concat("\"src\":"); 
-            gps_payload.concat("\"Cache\"");
-            gps_payload.concat("}");  
-            local_logger("GPS Data from Cache!");
-            local_logger(gps_payload);
-            if (show_status) {
-                blink_led(0,255,0);
-            }
-        }        
-    }
-    return gps_payload;
-}
 
 // Get GPS Payload with Cache
-String get_gps_payload(bool show_status=false) {
-
-    String gps_payload = "";
-    #ifdef DEBUG
-        Serial.println("Time Now: ");
-        Serial.println(millis());
-        Serial.println("Running Time Now: ");
-        Serial.println(gps_running_time);
-        Serial.println("CHECK_FIRMWARE_UPDATE: ");
-        Serial.println(CHECK_FIRMWARE_UPDATE);
-    #endif
-    if (gps_running_time >= CHECK_GPS_UPDATE) {
-        gps_running_time = 0;
-        local_logger("Checking GPS Position");
-        gps_payload = get_gps_position(show_status);
-    } else if(!get_gps_data && local_lat2 >= 8 && local_lat2 <= 11.5 && local_lon2 >= 82 && local_lon2 <= 86) {
-        gps_payload = "{\"lat\":";
-        gps_payload += String(local_lat2, 5);
-        gps_payload.concat(", \"lon\":");
-        gps_payload += String(local_lon2, 5);
-        gps_payload.concat(", \"src\":");
-        gps_payload.concat("\"Cache\"");
-        gps_payload.concat("}");
-        local_logger("GPS Data from Cache!");
-        local_logger(gps_payload);
-    } else {
-        local_logger("Checking GPS Position");
-        gps_payload = get_gps_position(show_status);
-    }    
-    return gps_payload;
-}
 
 
 /**
@@ -2023,38 +1055,40 @@ String get_gps_payload(bool show_status=false) {
  */
 bool send_all_queued_data() {
     if (!has_pending_data()) {
-        local_logger("No hay datos pendientes por enviar.");
+        local_logger("No queued data to send.");
         return true; 
     }
 
-    local_logger("Iniciando conexión de red para vaciar colas...");
+    local_logger("Connecting so the queue can drain...");
     if (!init_mqtt_connection()) {
-        local_logger("Fallo crítico: No se pudo conectar al Broker MQTT. Datos retenidos.");
+        local_logger("MQTT connect failed. Data kept locally.");
         return false;
     }
     
     set_mqtt_subscription();
     bool all_batches_ok = true;
+    int batches_sent = 0;
 
     // Bucle de paginación: mientras existan registros en RTC o SD...
-    while (has_pending_data()) {
+    while (has_pending_data() && batches_sent < max_backlog_batches) {
         feed_watchdog(); // Alimentamos el WDT en cada lote por seguridad
 
         // Extrae un arreglo JSON de hasta MAX_BATCH_SIZE lecturas: "[{...},{...}]"
         String batch_payload = get_batch_payload(); 
         if (batch_payload == "") break;
 
-        local_logger("Enviando lote paginado por MQTT...");
+        local_logger("Publishing a queued batch...");
         if (publish_sensor_payload(batch_payload)) {
             // Éxito: Se eliminan definitivamente estos registros de la fuente (RTC o SD)
-            commit_batch(); 
-            local_logger("Lote enviado y confirmado con éxito.");
+            commit_batch();
+            batches_sent++; 
+            local_logger("Batch published and committed.");
             
             // Un breve respiro para procesar respuestas del broker si es necesario
-            modem.mqtt_handle(5000); 
+            comm.mqtt_handle(5000); 
         } else {
             // Fallo de red/comunicación durante el envío
-            local_logger("Error al publicar el lote actual. Ejecutando Rollback...");
+            local_logger("Batch publish failed. Rolling back...");
             rollback_batch(); // Si venía de RTC y la SD está lista, los "derrama" a la SD
             all_batches_ok = false;
             break; // Abortamos el bucle para no seguir perdiendo paquetes
@@ -2064,185 +1098,105 @@ bool send_all_queued_data() {
     return all_batches_ok;
 }
 
-// The setup function controls the main program flow and runs once at startup and every wakeup
+#include "wake_cycle.h"
+#include "network.h"
+#include "sensors.h"
+#include "gps_module.h"
+#include "power_policy.h"
+
 void setup() {
-    bool has_been_configured = true;
-    init_watchdog();
-    g_wake_start_ms = millis();
-    rtc_persist_boot();
-    if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {
-        load_device_params();
-    }
-
-    init_modem();
-
-    Serial.println(ESP.getEfuseMac());
- 
-    // Panic and watchdog resets keep the queue. Force one OTA check.
-    if (rtc_reset_was_panic()) {
-        local_logger("Panic or watchdog reset. Forcing OTA rescue.");
-        init_network(MODEM_NETWORK_LTE, false);
-        check_for_firmware_update(true);
-        rtc_panic_flag = 0;
-        rtc_persist_commit();
-    }
-
-    bool result = false;
-
-    readingCnt++;
-
-    if (first_run) {
-        // Delay to install the station.
-        delay(30000);
-        feed_watchdog();
-    }    
-
-    queue_manager_init();
-
-    init_relay();
-    feed_watchdog();
-
-    // Rain reset is decided from the stored local day, never from first_run.
-
-    if (first_run || readingCnt >= (int)READING_COUNT) {
-        feed_watchdog();
-
-        local_logger("Initializing Network Try 1 LTE");
-        result = init_network(MODEM_NETWORK_LTE, first_run);
-        feed_watchdog();
-        
-        if (!result) {            
-            local_logger("Initializing Network Try 2 LTE");
-            result = init_network(MODEM_NETWORK_AUTO, first_run);
-            feed_watchdog();
-            if (!result) {
-                local_logger("Initializing Network Try 1 GSM");
-                result = init_network(MODEM_NETWORK_GSM, first_run);
-                feed_watchdog();
-            }
-        }
-        
-        if (result) {
-            check_for_firmware_update(false);
-
-            reliable_time_sync(modem);
-            feed_watchdog();
-
-            if (first_run) {
-                bool fetched = get_sensor_configuration(first_run);
-                feed_watchdog();
-                has_been_configured = fetched || sensor_config_present();
-            }
-        }
-    }
-
-    // Automatic Reset Rain Sensor
-    checkAndResetRainSensor();
-
-    // Init RS485 Modbus
-    init_peripherals();
-
-    // Set panic flag in RTC to recover in case of WDT reset during the critical section of sensor reading and data processing, 
-    //we will clear it at the end of the cycle if everything goes well
-    rtc_panic_flag = 1;
-    rtc_persist_commit();
-
-    // Give sensor current from battery and wait a bit for stabilization before reading them 
-    turn_sensors_on();
-    start_time = millis();
-
-    // Get GPS Payload (Utilizará el caché RTC automáticamente si el módem está apagado)
-    String gps_payload = get_gps_payload(first_run);
-    feed_watchdog();
-
-    // Start Async Sensors and Wait for them to be ready if we have any configured, 
-    //if not it will do nothing and we will read them immediately in the next step
-    prepare_async_sensors();
-    feed_watchdog();
-
-    // Wait for sensors to stabilize
-    wait_for_sensors();
-    feed_watchdog();
-
-    // FASE 2: Recolección inmediata de todos los sensores listos
-    String final_sensor_payload = get_final_sensor_payload();
-    feed_watchdog();
-
-    // Shutdown sensors
+    WakeState wake;
+    boot_start(wake);
+    network_provision(wake);
+    wake.sensors = sensors_sample(&wake.configured);
+    apply_pack_power(wake.sensors);
     turn_sensors_off();
-
-    // Do SD Card Diagnosis and Repair if needed
-    if (!is_sdcard_ok) {
-        local_logger("SD Card not OK! Attempting to diagnose and repair...");
-        is_sdcard_ok = diagnose_and_repair_sd();
-    }
-    
-    // Get Final Payload
-    if (!has_been_configured) {
-        JsonDocument config_error;
-        config_error["err"] = "CONFIGURATION_ERROR";
-        config_error["res"] = false;
-        if (final_sensor_payload.length() > 0 && final_sensor_payload.charAt(0) == '{') {
-            config_error["sensor_payload"] = serialized(final_sensor_payload);
-        } else {
-            config_error["sensor_payload"] = final_sensor_payload;
-        }
-        final_sensor_payload = "";
-        serializeJson(config_error, final_sensor_payload);
-    }
-    String payload_data = get_final_payload(final_sensor_payload, gps_payload, result);     
-
-    // Save always (RTC / Ring Buffer / SD Spillover)
-    queue_payload(payload_data);
-    local_logger("Lectura actual registrada en el gestor modular de colas.");
-
-    // =======================================================
-    // Transmission Phase: Only if we reached the READING_COUNT threshold, we will try to send all the accumulated data in one batch, 
-    // if not we will wait for the next cycle to accumulate more data and save energy by not turning on the modem
-    // =======================================================
-    if (readingCnt >= READING_COUNT) {        
-        local_logger("Se alcanzó el READING_COUNT. Procesando transmisión masiva...");
-        
-        // Try to send all queued data (RTC and SD) with a robust mechanism that handles partial failures and retries
-        if (result) {
-            result = send_all_queued_data();
-        }
-
-        if (result) {
-            readingCnt = 0;
-            consecutive_upload_failures = 0;            
-            local_logger("¡Fase de transmisión completada con éxito!");            
-        } else {
-            local_logger("Fallo en la transmisión. Los datos quedan seguros localmente.");
-            feed_watchdog();
-
-            // Increase the consecutive upload failures counter and check if we need to trigger a hardware reset to recover from potential network issues
-            consecutive_upload_failures++;
-            consecutive_network_changes++;
-            if (consecutive_upload_failures >= MAX_CONSECUTIVE_FAILURES) {
-                local_logger("Demasiados fallos de envio consecutivos. Forzando reinicio de hardware!");
-                consecutive_upload_failures = 0;
-                consecutive_network_changes = 0;
-                perform_restart();
-            }
-        }        
-    } else {
-        // No data transmission this cycle, just logging the reading count. The message was saved in the queue manager for local storage.
-        local_logger("Lectura acumulada. Ciclo intermedio de energía ultrabaja (", readingCnt, "/", READING_COUNT, ").");
-        feed_watchdog();
-    }
-
-    // =======================================================
-    // Reset panic flag and go to sleep
-    // =======================================================
-    rtc_panic_flag = 0;
-    first_run = 0;
-    rtc_persist_commit();
-    update_running_time(); 
-    go_sleep();
+    wake.gps = gps_sample(modem_was_powered, first_run);
+    network_transmit_if_needed(wake);
+    deliver_sample(wake);
+    sleep_now();
 }
 
-// The loop function is not used because we are using deep sleep
 void loop() {
-
 }
+
+
+static bool json_number(JsonVariant value) {
+    return !value.isNull() && !value.is<bool>() && !value.is<const char*>() && !value.is<JsonObject>() && !value.is<JsonArray>();
+}
+
+// Sample payload is {"v_s_p_0":{"b_v_v":1199}}. A full publish document nests that map under "sp".
+static bool pack_raw_from_payload(const String& payload, float* raw) {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) return false;
+    JsonObject sensors = doc.as<JsonObject>();
+    if (sensors.isNull()) return false;
+    JsonVariant wrapped = doc["sp"];
+    if (wrapped.is<JsonObject>()) sensors = wrapped.as<JsonObject>();
+    for (JsonPair entry : sensors) {
+        JsonObject reading = entry.value().as<JsonObject>();
+        if (reading.isNull()) continue;
+        if (!reading["err"].isUnbound()) continue;
+        JsonVariant value = reading[PACK_V_VALUE_NAME];
+        if (!json_number(value)) continue;
+        *raw = value.as<float>();
+        return true;
+    }
+    return false;
+}
+
+void apply_pack_power(const String& payload) {
+    float scale = PACK_V_SCALE;
+    float backend_scale = 0.0f;
+    bool backend_scale_found = sensor_measure_scale_find(PACK_V_VALUE_NAME, &backend_scale);
+    if (backend_scale_found) scale = backend_scale;
+
+    float raw = 0.0f;
+    bool saw_raw = pack_raw_from_payload(payload, &raw);
+    PackVolts pv;
+    pv.volts = -1.0f;
+    pv.valid = false;
+    if (saw_raw) pv = pack_volts_from_raw(raw, scale);
+
+    #ifdef DEBUG
+        Serial.print("Pack voltage ");
+        if (saw_raw) {
+            Serial.print(pv.volts, 2);
+            Serial.print(" V");
+        } else {
+            Serial.print("absent");
+        }
+        Serial.print(" scale source ");
+        Serial.println(backend_scale_found ? "backend" : "build");
+    #endif
+
+    PowerInput in = {};
+    in.pack_volts = pv.volts;
+    in.pack_valid = pv.valid;
+    in.previous = (PowerMode)saved_power_mode;
+    in.backend_sleep_sec = TIME_TO_SLEEP_SEC;
+    in.backend_reading_count = READING_COUNT;
+    PowerDecision decision = decide_power(in);
+    active_power_mode = (uint8_t)decision.mode;
+    active_sleep_sec = decision.eff_sleep_sec;
+    announce_power_mode = decision.changed;
+    saved_power_mode = decision.mode;
+    last_pack_volts = pv.valid ? pv.volts : -1;
+    if (pv.valid) daily_log_note_voltage(pv.volts);
+    if (!pv.valid) {
+        local_logger("Pack voltage missing or failed. Keeping the backend interval.");
+        add_sensor_error("[PACK_V_MISSING]");
+    }
+}
+
+
+void maybe_upload_logs() {
+    if (active_power_mode != POWER_NORMAL) return;
+    bool send_logs = false;
+    preferences.begin("devcfg", true);
+    send_logs = preferences.getBool("slogs", false);
+    preferences.end();
+    if (!send_logs && !announce_power_mode) return;
+    local_logger("Log upload is armed. The backend must supply a pre-signed URL.");
+}
+

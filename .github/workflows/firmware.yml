@@ -1,0 +1,29 @@
+name: firmware
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Placeholder certificates
+        run: |
+          python3 - << 'PY'
+          from pathlib import Path
+          certs = Path("endnode/certs")
+          certs.mkdir(parents=True, exist_ok=True)
+          (certs / "AWSClientCertificate.h").write_text('#include <pgmspace.h>\nstatic const char AWSClientCertificate[] PROGMEM = "placeholder-certificate\\n";\n')
+          (certs / "AWSClientPrivateKey.h").write_text('#include <pgmspace.h>\nstatic const char AWSClientPrivateKey[] PROGMEM = "placeholder-private-key\\n";\n')
+          PY
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build both images
+        run: pio run -e endnode_cell -e endnode_wifi
+      - name: Host tests
+        run: c++ -std=c++17 test/test_power_and_csv.cpp -Iendnode -o /tmp/firmware-tests && /tmp/firmware-tests
