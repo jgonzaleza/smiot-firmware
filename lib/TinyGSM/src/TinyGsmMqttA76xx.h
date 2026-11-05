@@ -87,7 +87,15 @@ public:
         }
 
         if (this->cert_pem || this->client_cert_pem || this->client_key_pem) {
-            if (this->cert_pem) {
+            bool certs_present = false;
+            thisModem().sendAT("+CCERTLIST");
+            String cert_list;
+            if (thisModem().waitResponse(5000UL, cert_list) == 1) {
+                certs_present = cert_list.indexOf("ca_cert.pem") >= 0
+                    && cert_list.indexOf("\"cert.pem\"") >= 0
+                    && cert_list.indexOf("key_cert.pem") >= 0;
+            }
+            if (this->cert_pem && !certs_present) {
                 thisModem().sendAT("+CCERTDOWN=\"ca_cert.pem\",", strlen(this->cert_pem));
                 if (thisModem().waitResponse(10000UL, ">") == 1) {
                     thisModem().stream.write(this->cert_pem);
@@ -100,7 +108,7 @@ public:
                 thisModem().waitResponse();
 
             }
-            if (this->client_cert_pem) {
+            if (this->client_cert_pem && !certs_present) {
                 thisModem().sendAT("+CCERTDOWN=\"cert.pem\",", strlen(this->client_cert_pem));
                 if (thisModem().waitResponse(10000UL, ">") == 1) {
                     thisModem().stream.write(this->client_cert_pem);
@@ -113,7 +121,7 @@ public:
                 thisModem().waitResponse();
 
             }
-            if (this->client_key_pem) {
+            if (this->client_key_pem && !certs_present) {
                 thisModem().sendAT("+CCERTDOWN=\"key_cert.pem\",", strlen(this->client_key_pem));
                 if (thisModem().waitResponse(10000UL, ">") == 1) {
                     thisModem().stream.write(this->client_key_pem);
@@ -124,6 +132,20 @@ public:
                 }
                 thisModem().sendAT("+CSSLCFG=\"clientkey\",0,\"key_cert.pem\"");
                 thisModem().waitResponse();
+            }
+            if (certs_present) {
+                if (this->cert_pem) {
+                    thisModem().sendAT("+CSSLCFG=\"cacert\",0,\"ca_cert.pem\"");
+                    thisModem().waitResponse();
+                }
+                if (this->client_cert_pem) {
+                    thisModem().sendAT("+CSSLCFG=\"clientcert\",0,\"cert.pem\"");
+                    thisModem().waitResponse();
+                }
+                if (this->client_key_pem) {
+                    thisModem().sendAT("+CSSLCFG=\"clientkey\",0,\"key_cert.pem\"");
+                    thisModem().waitResponse();
+                }
             }
 
             // authMethod:
