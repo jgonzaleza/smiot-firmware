@@ -16,6 +16,8 @@
  *                    Add auto restart when sensors payload becomes null for consecutive measurements.
  *                    Add support for sensors with floating point values.
  *                    Add support for network timeouts during firmware updates.
+ * Change Log: v310 - RTC state survives resets. Queue bounds, MQTT parameter clamps,
+ *                    watchdog deadlines, crash-safe SD offset, error ring.
  */
 
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
@@ -26,6 +28,7 @@
 //#define DEBUG true
 
 // Include Headers
+#include "tinygsm_yield.h"
 #include "utilities.h"     // Board specific pin definitions
 #include "error_codes.h"
 #include "logger.h"
@@ -33,6 +36,8 @@
 #include "custom_pins.h"
 #include "time_manager.h"
 #include "queue_manager.h"
+#include "csv_parse.h"
+#include "param_limits.h"
 
 // External Libraries
 #include <ModbusMaster.h>
@@ -66,15 +71,7 @@ const char *hologram_id = "89464";
 const char *emnify_apn = "emnify";
 const char *emnify_id = "89883";
 String global_apn = DEFAULT_NETWORK_APN;
-RTC_DATA_ATTR int current_network_index = 0; // Operator index(ICE, Liberty, Claro, Movistar, etc) used for the cellular connection, 
-                                             // we will cycle through them in case of repeated upload failures to try to recover 
-                                             // connectivity (Zombie Network Recovery)
-const char* CR_NETWORKS[4] = {"AUTO", "71203", "71204", "71201"}; // We will use AUTO (which cycles through all available networks) 
-                                                                  // as the default, but we can switch to specific ones if needed in 
-                                                                  // case of connectivity issues to try to recover (Zombie Network Recovery) 
-RTC_DATA_ATTR int consecutive_upload_failures = 0; // Counter for consecutive upload failures
-RTC_DATA_ATTR int consecutive_network_changes = 0; // Counter for consecutive network changes
-RTC_DATA_ATTR int consecutive_null_errors = 0; // Counter for consecutive null pointer errors during upload
+const char* CR_NETWORKS[4] = {"AUTO", "71203", "71204", "71201"};
 #define MAX_CONSECUTIVE_FAILURES 12 // Max number of consecutive failures before giving up and restarting
 #define MAX_NETWORK_FAILURES 3 // Max consecutive network failures before we trigger a network change
 
@@ -112,7 +109,6 @@ const int firmware_version = FIRMWARE_VERSION;
 #define uS_TO_S_FACTOR 1000000ULL
 #define DEFAULT_SLEEP_SEC 510 // Default sleep time between measurements (5 mins)
 RTC_DATA_ATTR uint32_t TIME_TO_SLEEP_SEC = DEFAULT_SLEEP_SEC; // Time to sleep between measurements
-RTC_DATA_ATTR unsigned int readingCnt = 0; 
 
 // Queue and Storage
 #define maximumReadings 2000 // The maximum number of readings that can be stored in the available space
@@ -124,7 +120,6 @@ RTC_DATA_ATTR unsigned int readingCnt = 0;
 #define DEFAULT_READING_COUNT           1
 #define DEFAULT_TIME_BETWEEN_READINGS   1 // Time between readings in seconds
 #define DEFAULT_READING_RATE            1 // How many readings
-#define DEFAULT_CHECK_FIRMWARE_UPDATE 86400000L
 #define DEFAULT_CHECK_PARAMETERS_UPDATE 3600000L
 #define DEFAULT_CHECK_GPS_UPDATE 86400000L
 RTC_DATA_ATTR unsigned int TIME_TO_READ_SENSOR = DEFAULT_TIME_TO_READ_SENSOR;
@@ -140,11 +135,10 @@ RTC_DATA_ATTR char rtc_sd_error_log[256] = ""; // Log for SD card diagnostics, s
 // Sensor Diagnostics Parameters
 RTC_DATA_ATTR char rtc_sensor_error_log[256] = ""; // Log for Sensor diagnostics, stored in RTC for persistence across reboots
 
-// Init parameters
-RTC_DATA_ATTR bool first_run = true;
+// Init parameters. first_run, the panic flag, counters and the rain day
+// live in RTC_NOINIT (see rtc_persist.h) so a restart does not wipe them.
 unsigned long start_time = 0;
-RTC_DATA_ATTR long lastResetDayNumber = -1; // Used for automatic rain sensor reset logic, initialized to -1 to ensure it runs on the first day
-RTC_DATA_ATTR int rtc_panic_flag = 0; // Flag to indicate if the last reset was due to a panic (watchdog timeout)
+unsigned long g_wake_start_ms = 0;
 
 //GPS update parameters
 RTC_DATA_ATTR bool get_gps_data;
@@ -214,7 +208,9 @@ void init_peripherals() {
 // Initialize MQTT Connection
 bool init_mqtt_connection() {
     bool mqtt_connect_result = false;
+    unsigned long phase_start = millis();
     local_logger("MQTT Begin . . .");
+    feed_watchdog();
     // Initialize MQTT, use SSL
     modem.mqtt_begin(true);
 
@@ -228,6 +224,10 @@ bool init_mqtt_connection() {
 
     int k = 10;
     while (!mqtt_connect_result && (k > 0)) {
+        if (phase_deadline_hit(phase_start, MQTT_PHASE_BUDGET_MS)) {
+            local_logger("init_mqtt_connection deadline");
+            return false;
+        }
         k--;
         // Check the connection every ten seconds
         #ifdef DEBUG
@@ -278,16 +278,20 @@ void set_mqtt_subscription() {
 
 // Wait for sensors to stabilize
 void wait_for_sensors(){
-    //IF SIM initialization and GPS lasted less than 15 sec, we want to give sensors at least 15 sec to stabilize
-    // and get data from them.
-
-    unsigned long end_time = millis();
-    unsigned long elapsed_time = end_time - start_time;
-    while (elapsed_time < TIME_TO_READ_SENSOR) {
+    unsigned long phase_start = millis();
+    unsigned long elapsed_time = millis() - start_time;
+    unsigned long cap = TIME_TO_READ_SENSOR;
+    if (cap < TTR_SENSOR_MIN_MS) cap = TTR_SENSOR_MIN_MS;
+    if (cap > TTR_SENSOR_MAX_MS) cap = TTR_SENSOR_MAX_MS;
+    while (elapsed_time < cap) {
+        if (phase_deadline_hit(phase_start, cap + 1000UL)) {
+            local_logger("wait_for_sensors deadline");
+            break;
+        }
         local_logger("Waiting for minimal sensor time . . .");
         delay(1000);
-        end_time = millis();
-        elapsed_time = end_time - start_time;
+        feed_watchdog();
+        elapsed_time = millis() - start_time;
     }
     #ifdef DEBUG
         local_logger("######>>>>>> Slapsed Time: ");
@@ -331,39 +335,38 @@ void perform_restart() {
 
 // Automatic Rain Sensor Reset Logic
 void checkAndResetRainSensor() {
-    long currentTimestampUtc = get_current_timestamp();
-
-    // Fallback de seguridad por si falla la red/NTP en este ciclo.
+    long currentTimestampUtc = (long)get_current_timestamp();
     if (currentTimestampUtc <= 0) {
-        return; 
-    }
-
-    // Calculamos el tiempo local (UTC-6)
-    const long timezoneOffset = -21600; 
-    long localTimestamp = currentTimestampUtc + timezoneOffset;
-
-    // Calculamos el número de día actual (días transcurridos desde el epoch)
-    long currentDayNumber = localTimestamp / 86400;
-
-    // Caso 1: Arranque en frío (Cold Boot) o primera vez que se ejecuta.
-    // El dispositivo se acaba de encender (se le puso la batería o hubo un apagón).
-    // Inicializamos el día actual, pero NO reiniciamos el sensor para no borrar 
-    // datos previos a menos que estemos seguros del cambio de día.
-    if (lastResetDayNumber == -1) {
-        lastResetDayNumber = currentDayNumber;
-        local_logger("Cold boot: Initialized lastResetDayNumber to ", currentDayNumber);
         return;
     }
 
-    // Caso 2: Despertar de Deep Sleep (Warm Boot).
-    // Comparamos el día actual con el día guardado en la memoria RTC.
-    if (currentDayNumber != lastResetDayNumber) {
-        // Ha ocurrido un cambio de día, es hora de reiniciar el sensor de lluvia.
+    // Local offset stays the compiled Costa Rica value until the COUNTRY setting.
+    const long timezoneOffset = -21600;
+    long localTimestamp = currentTimestampUtc + timezoneOffset;
+    if (localTimestamp < 0) return;
 
-        // Actualizamos el registro en la memoria RTC para mañana
+    long currentDayNumber = localTimestamp / 86400;
+    long secOfDay = localTimestamp % 86400;
+    const long MIDNIGHT_WINDOW_SEC = 30L * 60L;
+
+    if (lastResetDayNumber < 0) {
         lastResetDayNumber = currentDayNumber;
+        rtc_persist_commit();
+        local_logger("Rain day initialized to ", currentDayNumber);
+        return;
+    }
+
+    if (currentDayNumber == lastResetDayNumber) return;
+
+    long previousDay = lastResetDayNumber;
+    lastResetDayNumber = currentDayNumber;
+    rtc_persist_commit();
+    // Pulse the relay only near local midnight. A later wake must not wipe the day's rain.
+    if (secOfDay >= 0 && secOfDay <= MIDNIGHT_WINDOW_SEC) {
         reset_sensor();
-        local_logger("Rain sensor reset for new day. Old Day: ", lastResetDayNumber, " New Day: ", currentDayNumber);
+        local_logger("Rain sensor reset near local midnight. Old day ", previousDay, " new day ", currentDayNumber);
+    } else {
+        local_logger("Day changed outside the midnight window. Rain relay not pulsed.");
     }
 }
 
@@ -394,74 +397,148 @@ void mqtt_disconnect() {
 }
 
 
+void clamp_runtime_params() {
+    TIME_TO_SLEEP_SEC = clamp_u32(TIME_TO_SLEEP_SEC, TTS_SEC_MIN, TTS_SEC_MAX);
+    TIME_TO_READ_SENSOR = clamp_u32(TIME_TO_READ_SENSOR, TTR_SENSOR_MIN_MS, TTR_SENSOR_MAX_MS);
+    READING_COUNT = clamp_u32(READING_COUNT, R_COUNT_MIN, R_COUNT_MAX);
+    if (TIME_BETWEEN_READINGS > TB_READINGS_MAX_SEC) TIME_BETWEEN_READINGS = TB_READINGS_MAX_SEC;
+    READING_RATE = clamp_u32(READING_RATE, R_RATE_MIN, R_RATE_MAX);
+    if (CHECK_FIRMWARE_UPDATE < C_F_UPDATE_MIN_MS) CHECK_FIRMWARE_UPDATE = C_F_UPDATE_MIN_MS;
+    if (CHECK_FIRMWARE_UPDATE > C_F_UPDATE_MAX_MS) CHECK_FIRMWARE_UPDATE = C_F_UPDATE_MAX_MS;
+    if (local_lat2 < -90.0f || local_lat2 > 90.0f) local_lat2 = 0;
+    if (local_lon2 < -180.0f || local_lon2 > 180.0f) local_lon2 = 0;
+}
+
+void save_device_params() {
+    preferences.begin("devcfg", false);
+    preferences.putUInt("phash", g_rtc.param_hash);
+    preferences.putUInt("rsid", g_rtc.last_restart_id);
+    preferences.putUInt("tts", TIME_TO_SLEEP_SEC);
+    preferences.putUInt("ttr", TIME_TO_READ_SENSOR);
+    preferences.putUInt("rcount", READING_COUNT);
+    preferences.putUInt("tbr", TIME_BETWEEN_READINGS);
+    preferences.putUInt("rrate", READING_RATE);
+    preferences.putBool("ggps", get_gps_data);
+    preferences.putUInt("cfw", (uint32_t)CHECK_FIRMWARE_UPDATE);
+    preferences.putFloat("lat", local_lat2);
+    preferences.putFloat("lon", local_lon2);
+    preferences.end();
+}
+
+void load_device_params() {
+    if (!preferences.begin("devcfg", true)) return;
+    if (!preferences.isKey("phash")) {
+        preferences.end();
+        return;
+    }
+    TIME_TO_SLEEP_SEC = preferences.getUInt("tts", TIME_TO_SLEEP_SEC);
+    TIME_TO_READ_SENSOR = preferences.getUInt("ttr", TIME_TO_READ_SENSOR);
+    READING_COUNT = preferences.getUInt("rcount", READING_COUNT);
+    TIME_BETWEEN_READINGS = preferences.getUInt("tbr", TIME_BETWEEN_READINGS);
+    READING_RATE = preferences.getUInt("rrate", READING_RATE);
+    get_gps_data = preferences.getBool("ggps", get_gps_data);
+    CHECK_FIRMWARE_UPDATE = preferences.getUInt("cfw", (uint32_t)CHECK_FIRMWARE_UPDATE);
+    local_lat2 = preferences.getFloat("lat", local_lat2);
+    local_lon2 = preferences.getFloat("lon", local_lon2);
+    g_rtc.param_hash = preferences.getUInt("phash", 0);
+    g_rtc.last_restart_id = preferences.getUInt("rsid", 0);
+    preferences.end();
+    clamp_runtime_params();
+    rtc_persist_commit();
+}
+
 // MQTT Callback to receive parameters
 void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len) {
 
     #ifdef DEBUG
         Serial.println();
-        Serial.println("======MQTT CALLBACK======");        
+        Serial.println("======MQTT CALLBACK======");
         Serial.println();
-        Serial.print("Topic:"); 
+        Serial.print("Topic:");
         Serial.println(topic);
     #endif
-    char* payload_str = (char*)payload;
+    if (payload == nullptr || len == 0) return;
+
     JsonDocument parameters_payload;
+    DeserializationError json_error = deserializeJson(parameters_payload, payload, len);
+    if (json_error) {
+        local_logger("MQTT parameter JSON rejected");
+        return;
+    }
 
-    #ifdef DEBUG
-        Serial.println("Payload: ");
-        Serial.println(payload_str);
-    #endif
+    uint32_t hash = payload_hash32(payload, len);
+    bool restart_requested = false;
+    uint32_t restart_id = 0;
+    if (!parameters_payload["RESTART"].isNull() && parameters_payload["RESTART"].as<bool>()) {
+        if (!parameters_payload["RESTART_ID"].isNull()) {
+            restart_id = parameters_payload["RESTART_ID"].as<uint32_t>();
+        }
+        if (restart_id == 0) restart_id = hash;
+        if (restart_id != g_rtc.last_restart_id) restart_requested = true;
+    }
 
-    //Conver the String to JSON Document
-    deserializeJson(parameters_payload, payload_str);
+    // Retained messages (60 s) are delivered again on the next connect.
+    // Skip them when neither the body nor the restart id is new.
+    if (hash == g_rtc.param_hash && !restart_requested) {
+        parameters_payload.clear();
+        return;
+    }
 
-    //check if the payload contains the reset rain sensor command
-    reset_rain_sensor = parameters_payload["RR_SENSOR"].as<bool>();
-    if (reset_rain_sensor) {
-        local_logger("⚠️ Reset rain sensor command received!");
-        reset_rain_sensor = false;
+    if (!parameters_payload["RR_SENSOR"].isNull() && parameters_payload["RR_SENSOR"].as<bool>()) {
+        local_logger("Reset rain sensor command received");
         reset_sensor();
     }
 
-    //Check remote restart command
-    if (parameters_payload["RESTART"].as<bool>() == true) {
-        local_logger("⚠️ Remote restart command received!");
-        // Give the serial port time to finish printing the log
-        delay(500);         
-        // Hard Restart the ESP32
-        perform_restart();
+    if (!parameters_payload["TTS_SEC"].isNull()) {
+        TIME_TO_SLEEP_SEC = clamp_i32_to_u32(parameters_payload["TTS_SEC"].as<long>(), TTS_SEC_MIN, TTS_SEC_MAX);
+    }
+    if (!parameters_payload["TTR_SENSOR"].isNull()) {
+        TIME_TO_READ_SENSOR = clamp_i32_to_u32(parameters_payload["TTR_SENSOR"].as<long>(), TTR_SENSOR_MIN_MS, TTR_SENSOR_MAX_MS);
+    }
+    if (!parameters_payload["R_COUNT"].isNull()) {
+        READING_COUNT = clamp_i32_to_u32(parameters_payload["R_COUNT"].as<long>(), R_COUNT_MIN, R_COUNT_MAX);
+    }
+    if (!parameters_payload["TB_READINGS"].isNull()) {
+        long gap = parameters_payload["TB_READINGS"].as<long>();
+        if (gap < 0) gap = 0;
+        if (gap > (long)TB_READINGS_MAX_SEC) gap = TB_READINGS_MAX_SEC;
+        TIME_BETWEEN_READINGS = (unsigned int)gap;
+    }
+    if (!parameters_payload["R_RATE"].isNull()) {
+        READING_RATE = clamp_i32_to_u32(parameters_payload["R_RATE"].as<long>(), R_RATE_MIN, R_RATE_MAX);
+    }
+    if (!parameters_payload["G_GPS_DATA"].isNull()) {
+        get_gps_data = parameters_payload["G_GPS_DATA"].as<bool>();
+    }
+    if (!parameters_payload["C_F_UPDATE"].isNull()) {
+        long check_ms = parameters_payload["C_F_UPDATE"].as<long>();
+        if (check_ms < (long)C_F_UPDATE_MIN_MS) check_ms = (long)C_F_UPDATE_MIN_MS;
+        if (check_ms > (long)C_F_UPDATE_MAX_MS) check_ms = (long)C_F_UPDATE_MAX_MS;
+        CHECK_FIRMWARE_UPDATE = (unsigned long)check_ms;
+    }
+    if (!parameters_payload["L_LAT"].isNull()) {
+        float lat = parameters_payload["L_LAT"].as<float>();
+        if (lat >= -90.0f && lat <= 90.0f) local_lat2 = lat;
+    }
+    if (!parameters_payload["L_LONG"].isNull()) {
+        float lon = parameters_payload["L_LONG"].as<float>();
+        if (lon >= -180.0f && lon <= 180.0f) local_lon2 = lon;
     }
 
+    if (hash != g_rtc.param_hash || restart_requested) {
+        g_rtc.param_hash = hash;
+        if (restart_requested) g_rtc.last_restart_id = restart_id;
+        save_device_params();
+        rtc_persist_commit();
+    }
 
-    TIME_TO_SLEEP_SEC = parameters_payload["TTS_SEC"].as<int>();
-    TIME_TO_READ_SENSOR = parameters_payload["TTR_SENSOR"].as<int>();
-    READING_COUNT = parameters_payload["R_COUNT"].as<int>();
-    TIME_BETWEEN_READINGS = parameters_payload["TB_READINGS"].as<int>();
-    READING_RATE = parameters_payload["R_RATE"].as<int>();
-    get_gps_data = parameters_payload["G_GPS_DATA"].as<bool>();
-    CHECK_FIRMWARE_UPDATE = parameters_payload["C_F_UPDATE"].as<long>();
-    local_lat2 = parameters_payload["L_LAT"].as<double>();
-    local_lon2 = parameters_payload["L_LONG"].as<double>();            
+    parameters_payload.clear();
 
-
-    #ifdef DEBUG
-        Serial.println("NEW TIME_TO_SLEEP_SEC: ");
-        Serial.println(TIME_TO_SLEEP_SEC);
-        Serial.println("NEW TIME_TO_READ_SENSOR: ");
-        Serial.println(TIME_TO_READ_SENSOR);
-        Serial.println("NEW READING_COUNT: ");
-        Serial.println(READING_COUNT);
-        Serial.println("NEW TIME_BETWEEN_READINGS: ");
-        Serial.println(TIME_BETWEEN_READINGS);
-        Serial.println("NEW READING_RATE: ");
-        Serial.println(READING_RATE);
-        Serial.println("NEW get_gps_data: ");
-        Serial.println(get_gps_data);
-        Serial.println("NEW CHECK_FIRMWARE_UPDATE: ");
-        Serial.println(CHECK_FIRMWARE_UPDATE);
-    #endif
-
-    parameters_payload.clear();           
+    if (restart_requested) {
+        local_logger("Remote restart command received");
+        delay(500);
+        perform_restart();
+    }
 }
 
 // Check Firmware Update Function
@@ -545,7 +622,17 @@ void firmware_update(const char *bucket_name, const char *file_name){
         return;
     }
     local_logger("Reading firmware file. . .");
+    feed_watchdog();
+    unsigned long size_wait_start = millis();
     size_t firmware_size = modem.https_get_size();
+    feed_watchdog();
+    if (firmware_size == 0 || (millis() - size_wait_start) > HTTPS_SIZE_BUDGET_MS) {
+        local_logger("https_get_size failed or passed its deadline");
+        if (firmware_size == 0) {
+            modem.https_end();
+            return;
+        }
+    }
     
     // Begin Update firmware
     Serial.println("Start upgrade firmware ...");
@@ -746,7 +833,11 @@ void go_sleep(){
     #endif
 
     
-    esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP_SEC * uS_TO_S_FACTOR);
+    uint32_t awake_sec = (millis() - g_wake_start_ms) / 1000UL;
+    uint32_t sleep_sec = TIME_TO_SLEEP_SEC;
+    if (awake_sec + 1 < sleep_sec) sleep_sec = sleep_sec - awake_sec;
+    else sleep_sec = 1;
+    esp_sleep_enable_timer_wakeup((uint64_t)sleep_sec * uS_TO_S_FACTOR);
     delay(200);    
 
     esp_deep_sleep_start();
@@ -841,11 +932,16 @@ void init_modem() {
 
 // Initialize Network
 bool init_network(NetworkMode mode_setup_value, bool show_status=false) {
+    unsigned long phase_start = millis();
     // Check if SIM card is online
     SimStatus sim = SIM_ERROR;
     bool result = false;
     int k = 30;
     while ((sim != SIM_READY) && (k > 0)) {
+        if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
+            local_logger("init_network deadline");
+            return false;
+        }
         k--;
         sim = modem.getSimStatus();
         switch (sim) {
@@ -973,6 +1069,10 @@ bool init_network(NetworkMode mode_setup_value, bool show_status=false) {
     RegStatus status = REG_NO_RESULT;
     k = 60;
     while ((status == REG_NO_RESULT || status == REG_SEARCHING || status == REG_UNREGISTERED) && (k > 0)) {
+        if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
+            local_logger("init_network deadline");
+            return false;
+        }
         k--;
         status = modem.getRegistrationStatus();
         switch (status) {
@@ -1043,6 +1143,10 @@ bool init_network(NetworkMode mode_setup_value, bool show_status=false) {
         k = 60;
         enable_network = modem.enableNetwork();
         while (!enable_network && k > 0) {
+            if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
+                local_logger("init_network deadline");
+                return false;
+            }
             enable_network = modem.enableNetwork();
             local_logger("Trying to enable network: ", k); 
             if (show_status) {
@@ -1068,6 +1172,10 @@ bool init_network(NetworkMode mode_setup_value, bool show_status=false) {
         local_logger("TRY TO ENABLE NETWORK: ");
         k = 10;          
         while (ipAddress.isEmpty() && k > 0) {
+            if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
+                local_logger("init_network deadline");
+                return false;
+            }
             k--;
             #ifdef DEBUG
                 Serial.println("");
@@ -1078,6 +1186,10 @@ bool init_network(NetworkMode mode_setup_value, bool show_status=false) {
             int p = 5;
             bool enable_network = modem.enableNetwork();
             while (!enable_network && p > 0) {
+                if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
+                    local_logger("init_network deadline");
+                    return false;
+                }
                 p--;
                 #ifdef DEBUG
                     Serial.println("");
@@ -1319,90 +1431,138 @@ bool get_sensor_configuration(bool show_status=false) {
         delay(2000);
     #endif
     JsonArray sensors = parameters_payload["sensors"];
-    if (sensors.isNull() || sensors.size() <= 0) {
+    if (sensors.isNull() || sensors.size() <= 0 || sensors.size() > (size_t)namespaces_size) {
+        modem.https_end();
         if (show_status) {
             blink_led(255,0,0,10000);
         }
         return false;
     }
 
-    //Preferences Keys max lenght is 15 caracters
-    has_async_sensors = false;
-    int i = 0;
-    for (JsonVariant sensor_config: sensors) {
-        #ifdef DEBUG
-            Serial.println("NAMESPACE: ");        
-            Serial.print(namespace_id[i].c_str());
-            Serial.println(i);
-        #endif
-        preferences.begin(namespace_id[i].c_str());
-        preferences.clear();
-        String sensor_id = sensor_config["SENSOR_ID"].as<String>();
-        preferences.putString("SENSOR_ID", sensor_id);
+    struct PendingSensor {
+        String sensor_id;
+        int is_async;
+        int trig_reg;
+        int trig_val;
+        int stat_reg;
+        int ready_val;
+        int warmup_val;
+        uint32_t max_wait_ms;
+        int address;
+        int start_reg;
+        int regs;
+        int baud;
+        String value_names;
+        String value_types;
+        bool has_types;
+    };
 
-        // Check if configuration contains "IS_ASYNC"
-        int is_async = sensor_config["IS_ASYNC"] | 0;
-        preferences.putInt("IS_ASYNC", is_async);
-
-        if (is_async == 1) {
-            has_async_sensors = true;
-
-            int trig_reg = sensor_config["TRIG_REG"] | 0;
-            int trig_val = sensor_config["TRIG_VAL"] | 1;
-            int stat_reg = sensor_config["STAT_REG"] | 1;
-            int ready_val = sensor_config["READY_VAL"] | 3;
-            int warmup_val = sensor_config["WARMUP_VAL"] | 1;
-            uint32_t max_wait_ms = sensor_config["MAX_WAIT_MS"] | 60000;            
-            
-            // Save async parameters in preferences
-            preferences.putInt("TRIG_REG", trig_reg);
-            preferences.putInt("TRIG_VAL", trig_val);
-            preferences.putInt("STAT_REG", stat_reg);
-            preferences.putInt("READY_VAL", ready_val);
-            preferences.putInt("WARMUP_VAL", warmup_val);
-            preferences.putUInt("MAX_WAIT_MS", max_wait_ms);            
-            local_logger("Sensor", sensor_id, "will be treated as ASYNC. Trigger Register:", trig_reg, "Trigger Value:", trig_val, "Status Register:", stat_reg, "Ready Value:", ready_val, "Warmup Value:", warmup_val, "Max Wait (ms):", max_wait_ms);
-        } else {
-            local_logger("Sensor", sensor_id, "will be treated as SYNC. No async parameters will be stored.");
+    PendingSensor pending[8];
+    int pending_count = 0;
+    bool config_valid = true;
+    for (JsonVariant sensor_config : sensors) {
+        if (pending_count >= namespaces_size) {
+            config_valid = false;
+            break;
         }
+        PendingSensor& item = pending[pending_count];
+        item.sensor_id = sensor_config["SENSOR_ID"].as<String>();
+        item.sensor_id.trim();
+        item.is_async = sensor_config["IS_ASYNC"] | 0;
+        if (item.is_async != 0 && item.is_async != 1) item.is_async = 0;
+        item.address = sensor_config["SENSOR_ADDRESS"] | 0;
+        item.start_reg = sensor_config["START_HOLDING_REGISTER"] | 0;
+        item.regs = sensor_config["REGISTERS_TO_READ"] | 0;
+        item.baud = sensor_config["BAUD_RATE"] | 9600;
+        item.value_names = sensor_config["VALUE_NAMES"].as<String>();
+        item.has_types = sensor_config["VALUE_TYPES"].is<String>();
+        item.value_types = item.has_types ? sensor_config["VALUE_TYPES"].as<String>() : String("");
+        item.trig_reg = sensor_config["TRIG_REG"] | 0;
+        item.trig_val = sensor_config["TRIG_VAL"] | 1;
+        item.stat_reg = sensor_config["STAT_REG"] | 1;
+        item.ready_val = sensor_config["READY_VAL"] | 3;
+        item.warmup_val = sensor_config["WARMUP_VAL"] | 1;
+        item.max_wait_ms = sensor_config["MAX_WAIT_MS"] | 60000;
+        if (item.max_wait_ms < 1000) item.max_wait_ms = 1000;
+        if (item.max_wait_ms > 180000) item.max_wait_ms = 180000;
 
-        // Store async configuration in preferences        
-        preferences.putInt("SENSOR_ADDRESS", sensor_config["SENSOR_ADDRESS"].as<int>());
-        preferences.putInt("START_HOLD_REG", sensor_config["START_HOLDING_REGISTER"].as<int>());
-        preferences.putInt("REGS_TO_READ", sensor_config["REGISTERS_TO_READ"].as<int>());
-        preferences.putInt("BAUD_RATE", sensor_config["BAUD_RATE"] | 9600); // 9600 default baud rate if not specified
-        String value_names = sensor_config["VALUE_NAMES"].as<String>();
-        preferences.putString("VALUE_NAMES", value_names);
-        
-        if (sensor_config["VALUE_TYPES"].is<String>()) {
-            String value_types = sensor_config["VALUE_TYPES"].as<String>();
-            preferences.putString("VALUE_TYPES", value_types);
-            #ifdef DEBUG
-                Serial.print("Tipos de variables guardados (VALUE_TYPES): ");
-                Serial.println(value_types);
-            #endif
+        char name_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
+        bool names_truncated = false;
+        int name_count = csv_parse_tokens(item.value_names.c_str(), name_tokens, CSV_MAX_TOKENS, &names_truncated);
+        bool types_ok = true;
+        if (item.has_types) {
+            char type_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
+            bool types_truncated = false;
+            int type_count = csv_parse_tokens(item.value_types.c_str(), type_tokens, CSV_MAX_TOKENS, &types_truncated);
+            types_ok = !types_truncated && type_count == name_count;
         }
-
-        preferences.end();
-        i++;
-        if (show_status) {
-            blink_led(255,255,255,500);
+        if (item.sensor_id.length() == 0 || item.sensor_id.length() > 32
+            || item.address < 1 || item.address > 247
+            || item.start_reg < 0 || item.start_reg > 65535
+            || item.regs < 1 || item.regs > 32
+            || item.baud < 1200 || item.baud > 115200
+            || name_count < 1 || names_truncated || !types_ok) {
+            config_valid = false;
+            break;
         }
-
-        #ifdef DEBUG
-            Serial.println("sensor_id: ");
-            Serial.println(sensor_id);
-            delay(1000);
-        #endif
+        pending_count++;
+        feed_watchdog();
     }
 
-    //Release the Json Document
+    if (!config_valid || pending_count == 0) {
+        local_logger("Sensor config rejected. Previous configuration kept.");
+        parameters_payload.clear();
+        modem.https_end();
+        if (show_status) blink_led(255, 0, 0, 10000);
+        return false;
+    }
+
+    // Swap only after the whole document validated.
+    has_async_sensors = false;
+    for (int i = 0; i < namespaces_size; i++) {
+        preferences.begin(namespace_id[i].c_str(), false);
+        preferences.clear();
+        if (i < pending_count) {
+            PendingSensor& item = pending[i];
+            preferences.putString("SENSOR_ID", item.sensor_id);
+            preferences.putInt("IS_ASYNC", item.is_async);
+            if (item.is_async == 1) {
+                has_async_sensors = true;
+                preferences.putInt("TRIG_REG", item.trig_reg);
+                preferences.putInt("TRIG_VAL", item.trig_val);
+                preferences.putInt("STAT_REG", item.stat_reg);
+                preferences.putInt("READY_VAL", item.ready_val);
+                preferences.putInt("WARMUP_VAL", item.warmup_val);
+                preferences.putUInt("MAX_WAIT_MS", item.max_wait_ms);
+            }
+            preferences.putInt("SENSOR_ADDRESS", item.address);
+            preferences.putInt("START_HOLD_REG", item.start_reg);
+            preferences.putInt("REGS_TO_READ", item.regs);
+            preferences.putInt("BAUD_RATE", item.baud);
+            preferences.putString("VALUE_NAMES", item.value_names);
+            if (item.has_types) preferences.putString("VALUE_TYPES", item.value_types);
+        }
+        preferences.end();
+        feed_watchdog();
+        if (show_status) blink_led(255, 255, 255, 500);
+    }
+
     parameters_payload.clear();
     modem.https_end();
     if (show_status) {
         blink_led(255,255,255,500);
     }
     return true;
+}
+
+bool sensor_config_present() {
+    for (int i = 0; i < namespaces_size; i++) {
+        preferences.begin(namespace_id[i].c_str(), true);
+        bool present = preferences.isKey("SENSOR_ID");
+        preferences.end();
+        if (present) return true;
+    }
+    return false;
 }
 
 // Clear Sensors Configuration from Preferences
@@ -1559,7 +1719,10 @@ String get_final_sensor_payload(){
     JsonDocument doc;
     String final_sensor_payload;
     
-    for (int k=0;k<READING_RATE;k++) {
+    unsigned int rate = READING_RATE;
+    if (rate < R_RATE_MIN) rate = R_RATE_MIN;
+    if (rate > R_RATE_MAX) rate = R_RATE_MAX;
+    for (unsigned int k = 0; k < rate; k++) {
         for (int i=0;i<namespaces_size;i++) {
             #ifdef DEBUG
                 Serial.println(". . . get_final_sensor_payload . . .");
@@ -1590,35 +1753,24 @@ String get_final_sensor_payload(){
                     delay(100);
                 #endif
                 
-                String value_names[10];
-                int r=0,t=0;        
-                for(int j=0;j<str_value_names.length();j++) {
-                    if(str_value_names[j] == ',') {
-                        if (j-r > 1) {
-                            value_names[t] = str_value_names.substring(r,j);
-                            t++;
-                            r = j+1;
-                        }
-                    }
-                }
-                int value_names_size = t;
-
-                // Separación simple de tipos
-                String value_types[10];
-                bool has_types = false;
-                
+                char name_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
+                char type_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
+                bool names_truncated = false;
+                bool types_truncated = false;
+                int value_names_size = csv_parse_tokens(str_value_names.c_str(), name_tokens, CSV_MAX_TOKENS, &names_truncated);
+                int value_types_size = 0;
                 if (str_value_types.length() > 0) {
-                    has_types = true;
-                    int rt=0, tt=0;
-                    for(int j=0; j<str_value_types.length(); j++) {
-                        if(str_value_types[j] == ',') {
-                            if (j-rt > 1) { // Prevención estándar de comas vacías
-                                value_types[tt] = str_value_types.substring(rt,j);
-                                tt++;
-                                rt = j+1;
-                            }
-                        }
-                    }
+                    value_types_size = csv_parse_tokens(str_value_types.c_str(), type_tokens, CSV_MAX_TOKENS, &types_truncated);
+                }
+                if (names_truncated || types_truncated) {
+                    add_sensor_error("[CSV_TRUNC]");
+                }
+                String value_names[CSV_MAX_TOKENS];
+                String value_types[CSV_MAX_TOKENS];
+                for (int t = 0; t < value_names_size; t++) value_names[t] = name_tokens[t];
+                bool has_types = value_types_size > 0;
+                for (int t = 0; t < CSV_MAX_TOKENS; t++) {
+                    value_types[t] = (t < value_types_size) ? String(type_tokens[t]) : String("INTEGER");
                 }
 
                 // Llamada al método con la bandera has_types
@@ -1632,7 +1784,12 @@ String get_final_sensor_payload(){
             }
             preferences.end();                        
         }
-        delay(TIME_BETWEEN_READINGS);
+        unsigned long gap_sec = TIME_BETWEEN_READINGS;
+        if (gap_sec > TB_READINGS_MAX_SEC) gap_sec = TB_READINGS_MAX_SEC;
+        for (unsigned long sec = 0; sec < gap_sec; sec++) {
+            delay(1000);
+            feed_watchdog();
+        }
     }
 
     serializeJson(doc, final_sensor_payload);
@@ -1652,23 +1809,16 @@ String get_final_payload(String sensors_payload, String gps_payload, bool result
     size_t final_payload_size;
     unsigned long final_timestamp = get_current_timestamp();
 
-    if (sensors_payload == "" || sensors_payload == "null" || sensors_payload == "{}") {    
-        consecutive_null_errors++;    
-        local_logger("ERROR CRÍTICO: Payload de sensores nulo detectado.");
-        // Guardar el evento en la bitácora local (SD card) si está disponible
-        if (consecutive_null_errors == 1 || consecutive_null_errors % 24 == 0) {
-            local_logger("Payload nulo. Reiniciando el ESP32 (Fallo #" + String(consecutive_null_errors) + ").");
-            delay(500); 
-            perform_restart();       
-        } else {
-            local_logger("Payload nulo persistente. Omitiendo reinicio y red para ahorrar batería.");
-            add_sensor_error("[NULL_PAYLOAD_ERROR]:[" + String(consecutive_null_errors) + "]");            
-        } 
-    } else {
-        if (consecutive_null_errors > 0) {
-            local_logger("Sensores recuperados. Limpiando contador de fallos RTC a 0.");
-            consecutive_null_errors = 0;
-        }
+    if (sensors_payload == "" || sensors_payload == "null" || sensors_payload == "{}") {
+        consecutive_null_errors++;
+        rtc_persist_commit();
+        local_logger("ERROR CRITICO: Payload de sensores nulo. Se encola un registro de error.");
+        add_sensor_error("[NULL_PAYLOAD_ERROR]");
+        sensors_payload = "{\"err\":\"NULL_PAYLOAD\",\"n\":" + String((int)consecutive_null_errors) + "}";
+    } else if (consecutive_null_errors > 0) {
+        local_logger("Sensores recuperados. Limpiando contador de fallos RTC a 0.");
+        consecutive_null_errors = 0;
+        rtc_persist_commit();
     }
 
     doc["sp"] = serialized(sensors_payload);
@@ -1697,6 +1847,11 @@ String get_final_payload(String sensors_payload, String gps_payload, bool result
     if (sensor_errors.length() > 0) {
         sensor_errors.trim(); // Limpiamos espacios al inicio o final
         doc["sensor_err"] = sensor_errors; // Se agrega la llave solo si hay errores
+    }
+    char reset_errors[RTC_ERR_SLOTS * RTC_ERR_BYTES];
+    if (rtc_error_ring_format(reset_errors, sizeof(reset_errors)) > 0) {
+        doc["rst_err"] = reset_errors;
+        rtc_error_ring_clear();
     }
     // ==========================================
 
@@ -1912,26 +2067,28 @@ bool send_all_queued_data() {
 // The setup function controls the main program flow and runs once at startup and every wakeup
 void setup() {
     bool has_been_configured = true;
-    // Inicializar Watchdog Timer
     init_watchdog();
+    g_wake_start_ms = millis();
+    rtc_persist_boot();
+    if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {
+        load_device_params();
+    }
 
     init_modem();
 
     Serial.println(ESP.getEfuseMac());
  
-    // =======================================================
-    // 1. PANIC RESTART (WDT Reset)
-    // =======================================================
-    if (rtc_panic_flag == 1) {
-        local_logger("¡ALERTA! Reinicio por Pánico detectado. Forzando modo de Salvataje OTA.");        
-        init_network(MODEM_NETWORK_LTE, false); // Forzamos conexión a red
-        check_for_firmware_update(true);           // Intentamos bajar un parche
-        rtc_panic_flag = 0;                    // Limpiamos la bandera
+    // Panic and watchdog resets keep the queue. Force one OTA check.
+    if (rtc_reset_was_panic()) {
+        local_logger("Panic or watchdog reset. Forcing OTA rescue.");
+        init_network(MODEM_NETWORK_LTE, false);
+        check_for_firmware_update(true);
+        rtc_panic_flag = 0;
+        rtc_persist_commit();
     }
 
     bool result = false;
 
-    // Incremento exacto del ciclo actual (Corregido el doble incremento)
     readingCnt++;
 
     if (first_run) {
@@ -1940,25 +2097,16 @@ void setup() {
         feed_watchdog();
     }    
 
-    // Initialize the queue manager for the local storage
     queue_manager_init();
 
-    // Initialize Relay
     init_relay();
     feed_watchdog();
 
-    if (first_run) {
-        // Reset rain sensor
-        reset_sensor();
-        feed_watchdog();
-    }
+    // Rain reset is decided from the stored local day, never from first_run.
 
-    // Turn on the controller and try to connect to the network only if it's the first run or we reached the READING_COUNT threshold
-    if (first_run || readingCnt >= READING_COUNT) {
-        // Turn on the controller        
+    if (first_run || readingCnt >= (int)READING_COUNT) {
         feed_watchdog();
 
-        // We try two times with LTE and once with GSM
         local_logger("Initializing Network Try 1 LTE");
         result = init_network(MODEM_NETWORK_LTE, first_run);
         feed_watchdog();
@@ -1975,20 +2123,15 @@ void setup() {
         }
         
         if (result) {
-            // Check for firmware update
             check_for_firmware_update(false);
 
             reliable_time_sync(modem);
             feed_watchdog();
 
             if (first_run) {
-                // Clear any previous configuration
-                clear_sensors_configuration();
-                // Get sensor configuration                
-                result = get_sensor_configuration(first_run);
+                bool fetched = get_sensor_configuration(first_run);
                 feed_watchdog();
-                // Sensor configuration result is stored in the has_been_configured variable to be used later in the payload generation
-                has_been_configured = result;
+                has_been_configured = fetched || sensor_config_present();
             }
         }
     }
@@ -2002,6 +2145,7 @@ void setup() {
     // Set panic flag in RTC to recover in case of WDT reset during the critical section of sensor reading and data processing, 
     //we will clear it at the end of the cycle if everything goes well
     rtc_panic_flag = 1;
+    rtc_persist_commit();
 
     // Give sensor current from battery and wait a bit for stabilization before reading them 
     turn_sensors_on();
@@ -2035,7 +2179,16 @@ void setup() {
     
     // Get Final Payload
     if (!has_been_configured) {
-        final_sensor_payload = "{\"err\":\"CONFIGURATION_ERROR\",\"res\":false, \"sensor_payload\":\"" + final_sensor_payload + "\"}";
+        JsonDocument config_error;
+        config_error["err"] = "CONFIGURATION_ERROR";
+        config_error["res"] = false;
+        if (final_sensor_payload.length() > 0 && final_sensor_payload.charAt(0) == '{') {
+            config_error["sensor_payload"] = serialized(final_sensor_payload);
+        } else {
+            config_error["sensor_payload"] = final_sensor_payload;
+        }
+        final_sensor_payload = "";
+        serializeJson(config_error, final_sensor_payload);
     }
     String payload_data = get_final_payload(final_sensor_payload, gps_payload, result);     
 
@@ -2083,8 +2236,8 @@ void setup() {
     // Reset panic flag and go to sleep
     // =======================================================
     rtc_panic_flag = 0;
-
-    first_run = false;
+    first_run = 0;
+    rtc_persist_commit();
     update_running_time(); 
     go_sleep();
 }

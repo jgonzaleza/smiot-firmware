@@ -2,18 +2,16 @@
 #define QUEUE_MANAGER_H
 
 #include <Arduino.h>
+#include "rtc_persist.h"
 
 // ==============================================================================
 // CONFIGURACIÓN DE LA COLA RESILIENTE
 // ==============================================================================
-#define MAX_RTC_BUFFER_SIZE 7168 // Máximo de la memoria RTC lenta (seguro)
+#define MAX_RTC_BUFFER_SIZE RTC_POOL_BYTES
 #define MAX_BATCH_SIZE 4        // Máximo de lecturas por mensaje MQTT
 #define PAYLOAD_DELIMITER '\n'   // Separador de JSONs en nuestro pool
-
-// Variables en memoria RTC (Sobreviven al Deep Sleep)
-// Se declaran como extern aquí; se instanciarán en el .cpp
-extern RTC_DATA_ATTR char rtc_payload_pool[MAX_RTC_BUFFER_SIZE];
-extern RTC_DATA_ATTR int rtc_pool_length;
+#define SD_QUEUE_CAP_BYTES (8UL * 1024UL * 1024UL)
+#define SD_QUEUE_COMPACT_WASTE 65536UL
 
 // Variables de estado del Batch actual en memoria RAM (Se borran al dormir)
 extern String current_batch_payloads[MAX_BATCH_SIZE];

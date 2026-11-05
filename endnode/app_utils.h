@@ -1,15 +1,17 @@
 #ifndef APP_UTILS_H
 #define APP_UTILS_H
-#endif
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <SD.h>
+#include "tinygsm_yield.h"
 #include <TinyGSM.h>
 #include <esp_task_wdt.h>
 #include "custom_pins.h"
 #include "logger.h"
 #include "utilities.h"
+#include "rtc_persist.h"
+#include "param_limits.h"
 
 
 // 5 Minutes. If the board gets stuck for 5 mins without "feeding", it restarts.
@@ -36,6 +38,7 @@ inline void add_sd_error(String msg) {
     if (strlen(rtc_sd_error_log) + msg.length() < 255) {
         strcat(rtc_sd_error_log, msg.c_str());
     }
+    rtc_error_ring_push(msg.c_str());
 }
 
 // Return the current SD card diagnostic log and clear it from RTC
@@ -56,6 +59,7 @@ inline void add_sensor_error(String msg) {
     if (strlen(rtc_sensor_error_log) + msg.length() < 255) {
         strcat(rtc_sensor_error_log, msg.c_str());
     }
+    rtc_error_ring_push(msg.c_str());
 }
 
 inline String fetch_and_clear_sensor_errors() {
@@ -80,8 +84,23 @@ inline void feed_watchdog() {
     esp_task_wdt_reset();
 }
 
+extern unsigned long g_wake_start_ms;
+
+inline bool awake_budget_expired() {
+    return (millis() - g_wake_start_ms) >= AWAKE_BUDGET_MS;
+}
+
+// True when this phase, or the whole wake, has used its deadline.
+inline bool phase_deadline_hit(unsigned long phase_start, unsigned long budget_ms) {
+    feed_watchdog();
+    if ((millis() - phase_start) >= budget_ms) return true;
+    if (awake_budget_expired()) return true;
+    return false;
+}
+
 //Turn on the led for N milli seconds and then turn off the led
 inline void blink_led(int red, int green, int blue, int milli_sec=1000) {
+    feed_watchdog();
     analogWrite(LED_RED_PIN, red);
     analogWrite(LED_GREEN_PIN, green);
     analogWrite(LED_BLUE_PIN, blue);
@@ -90,6 +109,7 @@ inline void blink_led(int red, int green, int blue, int milli_sec=1000) {
     analogWrite(LED_GREEN_PIN, 0);
     analogWrite(LED_BLUE_PIN, 0);
     delay(milli_sec/2);
+    feed_watchdog();
 }
 
 
@@ -244,3 +264,5 @@ inline bool diagnose_and_repair_sd() {
     return is_healthy;
 }
 // ==============================================================================
+
+#endif
