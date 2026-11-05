@@ -67,8 +67,10 @@ bool apply_time_to_esp32(int year, int month, int day, int hour, int min, int se
     struct timeval now = { .tv_sec = time_val };
     settimeofday(&now, NULL);
     
-    Serial.printf("Time Updated: %04d-%02d-%02d %02d:%02d:%02d\n", 
+#ifdef DEBUG
+    Serial.printf("Time Updated: %04d-%02d-%02d %02d:%02d:%02d\n",
                   full_year, month, day, hour, min, sec);
+#endif
     return true;
 }
 
@@ -349,5 +351,28 @@ unsigned long get_accurate_timestamp(unsigned long reading_millis) {
         return 0; 
     }
 }
+
+#ifdef FEATURE_WIFI
+#include <WiFi.h>
+// One SNTP attempt after Wi-Fi is already connected. Does not open a second association.
+inline void reliable_time_sync_wifi() {
+    configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+    for (int i = 0; i < 10; i++) {
+        feed_watchdog();
+        time_t now = time(nullptr);
+        struct tm timeinfo;
+        gmtime_r(&now, &timeinfo);
+        if (timeinfo.tm_year + 1900 >= current_year) {
+            time_is_valid = true;
+            current_time_source = TIME_NTP;
+            last_sync_timestamp = (unsigned long)now;
+            local_logger("Wi-Fi SNTP sync ok");
+            return;
+        }
+        delay(500);
+    }
+    local_logger("Wi-Fi SNTP sync failed");
+}
+#endif
 
 #endif

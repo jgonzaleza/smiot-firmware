@@ -1,0 +1,28 @@
+diff --git a/lib/TinyGSM/src/TinyGsmClientA7608.h b/lib/TinyGSM/src/TinyGsmClientA7608.h
+index 8787f8e..aab361b 100644
+--- a/lib/TinyGSM/src/TinyGsmClientA7608.h
++++ b/lib/TinyGSM/src/TinyGsmClientA7608.h
+@@ -584,10 +584,10 @@ class TinyGsmA7608 : public TinyGsmModem<TinyGsmA7608>,
+       streamSkipUntil(',');               // GLONASS-SVs  satellite valid numbers
+       streamSkipUntil(',');               // GALILEO-SVs  satellite valid numbers
+       ilat  = streamGetFloatBefore(',');  // Latitude in ddmm.mmmmmm
+-      /* north =  */stream.read();              // N/S Indicator, N=north or S=south
++      char  north = stream.read();          // N/S Indicator, N=north or S=south
+       streamSkipUntil(',');
+       ilon = streamGetFloatBefore(',');  // Longitude in ddmm.mmmmmm
+-      /* east =  */stream.read();              // E/W Indicator, E=east or W=west
++      char  east = stream.read();           // E/W Indicator, E=east or W=west
+       streamSkipUntil(',');
+ 
+       // Date. Output format is ddmmyy
+@@ -612,8 +612,8 @@ class TinyGsmA7608 : public TinyGsmModem<TinyGsmA7608>,
+           *status = fixMode;
+       }
+       // Set pointers
+-      if (lat != NULL)  *lat = ilat;
+-      if (lon != NULL)  *lon = ilon;
++      if (lat != NULL)  *lat = (north == 'S' || north == 's') ? -ilat : ilat;
++      if (lon != NULL)  *lon = (east == 'W' || east == 'w') ? -ilon : ilon;
+       if (speed != NULL) *speed = ispeed;
+       if (alt != NULL) *alt = ialt;
+       if (vsat != NULL) *vsat = ivsat;

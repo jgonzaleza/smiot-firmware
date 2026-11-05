@@ -47,7 +47,6 @@
 #include <ArduinoJson.h>
 #include <ctime> 
 #include <Update.h>
-#include <WiFi.h>
 #include <driver/rtc_io.h>
 #include <string.h>
 #include <Preferences.h>
@@ -60,6 +59,16 @@
 #include "certs/AWSClientCertificate.h"
 #include "certs/AWSClientPrivateKey.h"
 #include "certs/AmazonRootCA.h"
+#include "CommunicationManager.h"
+#include "CellularCommunicationClient.h"
+#ifdef FEATURE_WIFI
+#include "WifiCommunicationClient.h"
+#endif
+
+// Production builds leave DEBUG unset, so console prints compile to a dead branch.
+#ifndef DEBUG
+#define Serial if (false) Serial
+#endif
 
 
 // ================= CONSTANTS & CONFIG ================= //
@@ -71,7 +80,8 @@ const char *hologram_id = "89464";
 const char *emnify_apn = "emnify";
 const char *emnify_id = "89883";
 String global_apn = DEFAULT_NETWORK_APN;
-const char* CR_NETWORKS[4] = {"AUTO", "71203", "71204", "71201"};
+char plmn_table[4][8] = {"AUTO", "71203", "71204", "71201"};
+long timezone_offset_sec = -21600;
 #define MAX_CONSECUTIVE_FAILURES 12 // Max number of consecutive failures before giving up and restarting
 #define MAX_NETWORK_FAILURES 3 // Max consecutive network failures before we trigger a network change
 
@@ -101,9 +111,14 @@ RTC_DATA_ATTR unsigned long firmware_running_time;
 
 
 //Device Type ID
-const int device_type = 2; //1: Compact Weather Station; 2: Compact Weather Station Configurable; 3: EndNode Configurable
+#ifndef DEFAULT_DEVICE_TYPE
+#define DEFAULT_DEVICE_TYPE 2
+#endif
+// Compiled default. The running value comes from the backend config when present.
+int active_device_type = DEFAULT_DEVICE_TYPE;
 //Firmware version defined in platformio.ini, should be updated with every firmware change to allow for proper OTA updates
-const int firmware_version = FIRMWARE_VERSION; 
+const int firmware_version = FIRMWARE_VERSION;
+#include "variant.h" 
 
 // Timing (Seconds)
 #define uS_TO_S_FACTOR 1000000ULL
@@ -160,6 +175,11 @@ TinyGsm modem(debugger);
 TinyGsm modem(SerialAT);
 #endif
 TinyGsmClient client(modem);
+CellularCommunicationClient cell_client;
+#ifdef FEATURE_WIFI
+WifiCommunicationClient wifi_client;
+#endif
+CommunicationManager comm;
 
 // Global Flags
 bool reset_rain_sensor = false; //Flag to reset rain sensor
@@ -168,6 +188,8 @@ bool reset_rain_sensor = false; //Flag to reset rain sensor
 const int namespaces_size = 8;
 String namespace_id[namespaces_size] = {"SENSOR_1", "SENSOR_2", "SENSOR_3", "SENSOR_4", "SENSOR_5", "SENSOR_6", "SENSOR_7", "SENSOR_8"};
 
+bool gps_fix_ok(float lat, float lon);
+
 // ================= FUNCTION DEFINITIONS ================= //
 
 
@@ -175,11 +197,11 @@ String namespace_id[namespaces_size] = {"SENSOR_1", "SENSOR_2", "SENSOR_3", "SEN
 bool publish_sensor_payload(String payload) {
     
     bool result = false;
-    if (modem.mqtt_connected()) {
+    if (comm.mqtt_connected()) {
         // If connected, send information          
         local_logger("Publish Current Data");
         String publish_topic = publish_topic_prefix + String(ESP.getEfuseMac());
-        result = modem.mqtt_publish(client_index, publish_topic.c_str(), payload.c_str());
+        result = comm.mqtt_publish(client_index, publish_topic.c_str(), payload.c_str());
         if (result) {
             local_logger("Data Published!");
             local_logger("#### Payload Sent ####");
@@ -212,11 +234,11 @@ bool init_mqtt_connection() {
     local_logger("MQTT Begin . . .");
     feed_watchdog();
     // Initialize MQTT, use SSL
-    modem.mqtt_begin(true);
+    comm.mqtt_begin(true);
 
     local_logger("MQTT Set Certificates . . .");
     // Set Amazon Certificate
-    modem.mqtt_set_certificate(AmazonRootCA, AWSClientCertificate, AWSClientPrivateKey);
+    comm.mqtt_set_certificate(AmazonRootCA, AWSClientCertificate, AWSClientPrivateKey);
     
     local_logger("MQTT Connecting . . .");
     // Connecting to AWS IOT Core
@@ -237,12 +259,12 @@ bool init_mqtt_connection() {
         if (!mqtt_connect_result) {            
             if (k == 5){
                 //Try to reset the connection
-                modem.mqtt_disconnect(client_index);
+                comm.mqtt_disconnect(client_index);
                 delay(1000);
-                modem.mqtt_end();
+                comm.mqtt_end();
                 delay(1000);
-                modem.mqtt_begin(true);
-                modem.mqtt_set_certificate(AmazonRootCA, AWSClientCertificate, AWSClientPrivateKey);
+                comm.mqtt_begin(true);
+                comm.mqtt_set_certificate(AmazonRootCA, AWSClientCertificate, AWSClientPrivateKey);
             } else {
                 delay(2000);
             }
@@ -266,10 +288,10 @@ void update_running_time() {
 // Set MQTT Subscription
 void set_mqtt_subscription() {
     // Set MQTT processing callback
-    modem.mqtt_set_callback(get_mqtt_parameters);
+    comm.mqtt_set_callback(get_mqtt_parameters);
     // Subscribe to topic
     String final_subscribe_topic = subscribe_topic_prefix + ESP.getEfuseMac();
-    if (modem.mqtt_subscribe(client_index, final_subscribe_topic.c_str())) {
+    if (comm.mqtt_subscribe(client_index, final_subscribe_topic.c_str())) {
         local_logger("Subscribed to topic: ", final_subscribe_topic);
     } else {
         local_logger("MQTT Subscribe Failed!");
@@ -341,8 +363,7 @@ void checkAndResetRainSensor() {
     }
 
     // Local offset stays the compiled Costa Rica value until the COUNTRY setting.
-    const long timezoneOffset = -21600;
-    long localTimestamp = currentTimestampUtc + timezoneOffset;
+    long localTimestamp = currentTimestampUtc + timezone_offset_sec;
     if (localTimestamp < 0) return;
 
     long currentDayNumber = localTimestamp / 86400;
@@ -376,12 +397,12 @@ bool mqtt_connect() {
 
     String dynamic_client_id = String(client_id_prefix) + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
 
-    bool ret = modem.mqtt_connect(client_index, broker, broker_port, dynamic_client_id.c_str());
+    bool ret = comm.mqtt_connect(client_index, broker, broker_port, dynamic_client_id.c_str());
     if (!ret) {
         local_logger("Failed!"); return false;
     }
 
-    if (modem.mqtt_connected()) {
+    if (comm.mqtt_connected()) {
         local_logger("MQTT has connected!");
     } else {
         return false;
@@ -392,7 +413,7 @@ bool mqtt_connect() {
 // MQTT Disconnect Function
 void mqtt_disconnect() {
     local_logger("MQTT Disconnecting . . .");
-    modem.mqtt_disconnect(client_index);
+    comm.mqtt_disconnect(client_index);
     delay(500);
 }
 
@@ -442,6 +463,18 @@ void load_device_params() {
     local_lon2 = preferences.getFloat("lon", local_lon2);
     g_rtc.param_hash = preferences.getUInt("phash", 0);
     g_rtc.last_restart_id = preferences.getUInt("rsid", 0);
+    active_device_type = preferences.getInt("dtype", active_device_type);
+    timezone_offset_sec = preferences.getInt("tz", (int)timezone_offset_sec);
+    String country = preferences.getString("ctry", "CR");
+    (void)country;
+    for (int i = 0; i < 4; i++) {
+        String key = "p" + String(i);
+        String plmn = preferences.getString(key.c_str(), "");
+        if (plmn.length() > 0 && plmn.length() < 8) {
+            strncpy(plmn_table[i], plmn.c_str(), 7);
+            plmn_table[i][7] = '\0';
+        }
+    }
     preferences.end();
     clamp_runtime_params();
     rtc_persist_commit();
@@ -547,35 +580,37 @@ JsonDocument check_firmware_update(){
     JsonDocument parameters_payload;
 
     // Initialize HTTPS
-    modem.https_begin();
+    comm.https_begin();
 
     // Set GET URT
-    if (!modem.https_set_url(CHECK_FIRMWARE_UPDATE_URL)) {
+    if (!comm.https_set_url(CHECK_FIRMWARE_UPDATE_URL)) {
         Serial.println("Failed to set the URL. Please check the validity of the URL!");
-        modem.https_end();
+        comm.https_end();
         return parameters_payload;
     } 
     // Send GET request
-    modem.https_add_header("X-API-Key", CHECK_FIRMWARE_KEY);
+    comm.https_add_header("X-API-Key", CHECK_FIRMWARE_KEY);
     int httpCode = 0;
     String post_payload = "{\"client_id\": \"";
     post_payload.concat(client_id_prefix);
     post_payload.concat("\", \"device_type\":");
-    post_payload.concat(device_type);
+    post_payload.concat(active_device_type);
+    post_payload.concat(", \"variant\":\"");
+    post_payload.concat(VARIANT_ID);
     post_payload.concat(", \"firmware_version\":");
     post_payload.concat(firmware_version);
     post_payload.concat(", \"device_id\": \"");
     post_payload.concat(ESP.getEfuseMac());
     post_payload.concat("\"}");
-    httpCode = modem.https_post(post_payload);
+    httpCode = comm.https_post(post_payload);
     if (httpCode != 200) {
         Serial.print("HTTP POST failed ! error code = "); 
         Serial.println(httpCode); 
-        modem.https_end();
+        comm.https_end();
         local_logger("HTTP get failed CHECK FIRMWARE UPDATE");
         return parameters_payload;
     }
-    String body = modem.https_body();
+    String body = comm.https_body();
     #ifdef DEBUG
         Serial.print("HTTP body : ");
         Serial.println(body);
@@ -584,7 +619,7 @@ JsonDocument check_firmware_update(){
     //Conver the String to JSON Document
     deserializeJson(parameters_payload, body);
 
-    modem.https_end();
+    comm.https_end();
 
     return parameters_payload;
 }
@@ -594,7 +629,7 @@ JsonDocument check_firmware_update(){
 void firmware_update(const char *bucket_name, const char *file_name){
 
     // Initialize HTTPS
-    modem.https_begin();
+    comm.https_begin();
     local_logger("Getting firmware file. . .");
 
     String final_url = BASE_FIRMWARE_UPDATE_URL;
@@ -603,33 +638,33 @@ void firmware_update(const char *bucket_name, const char *file_name){
     final_url.concat(file_name);
     local_logger("File Update URL: ");
     local_logger(final_url);
-    if (!modem.https_set_url(final_url)) {
+    if (!comm.https_set_url(final_url)) {
         Serial.println("Failed to set the URL. Please check the validity of the URL!");
-        modem.https_end();
+        comm.https_end();
         local_logger("Failed to set the URL. Please check the validity of the URL!");
         return;
     } 
 
     //Set API Key
-    modem.https_add_header("X-API-Key", FIRMWARE_UPDATE_KEY);
+    comm.https_add_header("X-API-Key", FIRMWARE_UPDATE_KEY);
     int httpCode = 0;
-    httpCode = modem.https_get();
+    httpCode = comm.https_get();
     if (httpCode != 200) {
         Serial.print("HTTP GET failed ! error code = "); 
         Serial.println(httpCode); 
         local_logger("HTTP GET failed ! FIRMWARE UPDATE");
-        modem.https_end();
+        comm.https_end();
         return;
     }
     local_logger("Reading firmware file. . .");
     feed_watchdog();
     unsigned long size_wait_start = millis();
-    size_t firmware_size = modem.https_get_size();
+    size_t firmware_size = comm.https_get_size();
     feed_watchdog();
     if (firmware_size == 0 || (millis() - size_wait_start) > HTTPS_SIZE_BUDGET_MS) {
         local_logger("https_get_size failed or passed its deadline");
         if (firmware_size == 0) {
-            modem.https_end();
+            comm.https_end();
             return;
         }
     }
@@ -650,7 +685,7 @@ void firmware_update(const char *bucket_name, const char *file_name){
 
     while (total < firmware_size) {
         // Read firmware from modem buffer
-        int len = modem.https_body(buffer, 1024);
+        int len = comm.https_body(buffer, 1024);
         
         if (len > 0) {
             written = Update.write(buffer, len);
@@ -694,7 +729,7 @@ void firmware_update(const char *bucket_name, const char *file_name){
 
     delay(500);
 
-    modem.https_end();
+    comm.https_end();
 
     esp_restart();    
     
@@ -912,9 +947,6 @@ void init_modem() {
         }
     }
 
-    //Disable WiFi
-    WiFi.mode(WIFI_OFF);
-
     //Put the Led Pin as Output
     pinMode(LED_RED_PIN, OUTPUT);
     pinMode(LED_GREEN_PIN, OUTPUT);
@@ -1045,7 +1077,8 @@ bool init_network(NetworkMode mode_setup_value, bool show_status=false) {
         modem.waitResponse(10000L, at_response);
         local_logger("Registro automático: ", at_response);
     } else {
-        String plmn = CR_NETWORKS[current_network_index];
+        String plmn = plmn_table[current_network_index];
+        if (plmn.length() == 0) plmn = "AUTO";
         local_logger("Forzando red manual (+COPS=1,2): ", plmn);
         
         // A. Forzamos el desregistro primero (Limpiar caché de la red zombie)
@@ -1363,17 +1396,17 @@ bool get_sensor_configuration(bool show_status=false) {
     // Initialize HTTPS
     if (show_status) {
         blink_led(255,255,255, 500);
-        modem.https_begin();
+        comm.https_begin();
         blink_led(255,255,255, 500);
     } else {
-        modem.https_begin();
+        comm.https_begin();
     }
 
 
     // Set GET URT
-    if (!modem.https_set_url(CONFIGURATION_SERVER_URL)) {
+    if (!comm.https_set_url(CONFIGURATION_SERVER_URL)) {
         Serial.println("Failed to set the URL. Please check the validity of the URL!");
-        modem.https_end();
+        comm.https_end();
         if (show_status) {
             blink_led(255,0,0,10000);
         }        
@@ -1384,21 +1417,21 @@ bool get_sensor_configuration(bool show_status=false) {
     }
 
     // Send POST request
-    modem.https_add_header("X-API-Key", CONFIGURATION_SERVER_KEY);
+    comm.https_add_header("X-API-Key", CONFIGURATION_SERVER_KEY);
     int httpCode = 0;
     String post_payload = "{\"device_type\": ";
-    post_payload.concat(device_type);
+    post_payload.concat(active_device_type);
     post_payload.concat(", \"device_id\": \"");
     post_payload.concat(device_id);
     post_payload.concat("\"}");
-    httpCode = modem.https_post(post_payload);
+    httpCode = comm.https_post(post_payload);
     if (show_status) {
         blink_led(255,255,255,500);
     }
     if (httpCode != 200) {
         Serial.print("HTTP get failed ! error code = "); 
         Serial.println(httpCode);         
-        modem.https_end();
+        comm.https_end();
         local_logger("HTTP get failed GET UPDATE PARAMETERS");
         if (show_status) {
             blink_led(255,0,0,10000);
@@ -1409,7 +1442,7 @@ bool get_sensor_configuration(bool show_status=false) {
     if (show_status) {
         blink_led(255,255,255,500);
     }
-    String body = modem.https_body();
+    String body = comm.https_body();
     if (show_status) {
         blink_led(255,255,255,500);
     }
@@ -1420,7 +1453,43 @@ bool get_sensor_configuration(bool show_status=false) {
     #endif
 
     //Conver the String to JSON Document
-    deserializeJson(parameters_payload, body);
+    DeserializationError config_error = deserializeJson(parameters_payload, body);
+    if (!config_error && !parameters_payload["DEVICE_TYPE"].isNull()) {
+        int role = parameters_payload["DEVICE_TYPE"].as<int>();
+        if (role >= 1 && role <= 9) {
+            active_device_type = role;
+            preferences.begin("devcfg", false);
+            preferences.putInt("dtype", role);
+            preferences.end();
+        }
+    }
+    if (!config_error && !parameters_payload["COUNTRY"].isNull()) {
+        JsonObject country = parameters_payload["COUNTRY"].as<JsonObject>();
+        long tz = country["tz_offset"] | (long)timezone_offset_sec;
+        if (tz < -50400) tz = -50400;
+        if (tz > 50400) tz = 50400;
+        timezone_offset_sec = tz;
+        const char* code = "CR";
+        if (!country["code"].isNull()) {
+            const char* parsed = country["code"].as<const char*>();
+            if (parsed && parsed[0]) code = parsed;
+        }
+        JsonArray plmn = country["plmn"].as<JsonArray>();
+        preferences.begin("devcfg", false);
+        preferences.putInt("tz", (int)timezone_offset_sec);
+        preferences.putString("ctry", code);
+        int slot = 0;
+        for (JsonVariant item : plmn) {
+            if (slot >= 4) break;
+            const char* text = item.as<const char*>();
+            if (!text || strlen(text) == 0 || strlen(text) > 7) continue;
+            strncpy(plmn_table[slot], text, 7);
+            plmn_table[slot][7] = '\0';
+            preferences.putString(("p" + String(slot)).c_str(), plmn_table[slot]);
+            slot++;
+        }
+        preferences.end();
+    }
     if (show_status) {
         blink_led(255,255,255,500);
     }
@@ -1432,7 +1501,7 @@ bool get_sensor_configuration(bool show_status=false) {
     #endif
     JsonArray sensors = parameters_payload["sensors"];
     if (sensors.isNull() || sensors.size() <= 0 || sensors.size() > (size_t)namespaces_size) {
-        modem.https_end();
+        comm.https_end();
         if (show_status) {
             blink_led(255,0,0,10000);
         }
@@ -1512,7 +1581,7 @@ bool get_sensor_configuration(bool show_status=false) {
     if (!config_valid || pending_count == 0) {
         local_logger("Sensor config rejected. Previous configuration kept.");
         parameters_payload.clear();
-        modem.https_end();
+        comm.https_end();
         if (show_status) blink_led(255, 0, 0, 10000);
         return false;
     }
@@ -1548,7 +1617,7 @@ bool get_sensor_configuration(bool show_status=false) {
     }
 
     parameters_payload.clear();
-    modem.https_end();
+    comm.https_end();
     if (show_status) {
         blink_led(255,255,255,500);
     }
@@ -1826,7 +1895,7 @@ String get_final_payload(String sensors_payload, String gps_payload, bool result
 
     doc["fv"] = firmware_version;
     doc["uid"] = String(ESP.getEfuseMac());
-    doc["dt"] = String(device_type);
+    doc["dt"] = String(active_device_type);
     doc["net"] = global_apn;
     doc["ts"] = (int)current_time_source;
     doc["tm"] = final_timestamp;
@@ -1944,7 +2013,7 @@ String get_gps_position(bool show_status=false) {
     }    
     Serial.println("DISABLE GPS . . .");
     modem.disableGPS();
-    if (lat2 >= 8 && lat2 <= 11.5 && lon2 >= 82 && lon2 <= 86){
+    if (gps_fix_ok(lat2, lon2)){
         //Si los datos están en los rangos normales para Costa Rica ya no los buscamos más.            
         #ifdef DEBUG
             local_logger("GET a Long and Lat. . .");
@@ -1962,7 +2031,7 @@ String get_gps_position(bool show_status=false) {
     } else {
         //If we don't get GPS data in the correct range, we decide to use a fix value
         get_gps_data = false;
-        if (!get_gps_data && local_lat2 >= 8 && local_lat2 <= 11.5 && local_lon2 >= 82 && local_lon2 <= 86) {
+        if (!get_gps_data && gps_fix_ok(local_lat2, local_lon2)) {
             gps_payload = "{";
             gps_payload.concat("\"lat\":"); 
             gps_payload += String(local_lat2, 5);
@@ -1999,7 +2068,7 @@ String get_gps_payload(bool show_status=false) {
         gps_running_time = 0;
         local_logger("Checking GPS Position");
         gps_payload = get_gps_position(show_status);
-    } else if(!get_gps_data && local_lat2 >= 8 && local_lat2 <= 11.5 && local_lon2 >= 82 && local_lon2 <= 86) {
+    } else if(!get_gps_data && gps_fix_ok(local_lat2, local_lon2)) {
         gps_payload = "{\"lat\":";
         gps_payload += String(local_lat2, 5);
         gps_payload.concat(", \"lon\":");
@@ -2051,7 +2120,7 @@ bool send_all_queued_data() {
             local_logger("Lote enviado y confirmado con éxito.");
             
             // Un breve respiro para procesar respuestas del broker si es necesario
-            modem.mqtt_handle(5000); 
+            comm.mqtt_handle(5000); 
         } else {
             // Fallo de red/comunicación durante el envío
             local_logger("Error al publicar el lote actual. Ejecutando Rollback...");
@@ -2065,11 +2134,69 @@ bool send_all_queued_data() {
 }
 
 // The setup function controls the main program flow and runs once at startup and every wakeup
+static const uint8_t CELL_RETRY_EVERY = 6;
+
+bool gps_fix_ok(float lat, float lon) {
+    if (lat < -90.0f || lat > 90.0f || lon < -180.0f || lon > 180.0f) return false;
+    if (lat == 0.0f && lon == 0.0f) return false;
+    if (lat == -1.0f && lon == -1.0f) return false;
+    return true;
+}
+
+void use_cell_client() {
+    comm.setClient(&cell_client);
+    g_rtc.last_transport = 0;
+    g_rtc.wakes_since_cell = 0;
+    rtc_persist_commit();
+}
+
+#ifdef FEATURE_WIFI
+bool use_wifi_client() {
+    feed_watchdog();
+    if (!wifi_client.network_connected() && !wifi_client.init_network()) return false;
+    comm.setClient(&wifi_client);
+    g_rtc.last_transport = 1;
+    if (g_rtc.wakes_since_cell < 255) g_rtc.wakes_since_cell++;
+    rtc_persist_commit();
+    return true;
+}
+#endif
+
+bool connect_uplink(bool show_status) {
+#ifdef FEATURE_WIFI
+    bool prefer_wifi = (g_rtc.last_transport == 1 && g_rtc.wakes_since_cell < CELL_RETRY_EVERY);
+    if (prefer_wifi && use_wifi_client()) return true;
+#endif
+    local_logger("Initializing Network Try 1 LTE");
+    bool ok = init_network(MODEM_NETWORK_LTE, show_status);
+    feed_watchdog();
+    if (!ok) {
+        local_logger("Initializing Network Try 2 LTE");
+        ok = init_network(MODEM_NETWORK_AUTO, show_status);
+        feed_watchdog();
+        if (!ok) {
+            local_logger("Initializing Network Try 1 GSM");
+            ok = init_network(MODEM_NETWORK_GSM, show_status);
+            feed_watchdog();
+        }
+    }
+    if (ok) {
+        use_cell_client();
+        return true;
+    }
+#ifdef FEATURE_WIFI
+    if (use_wifi_client()) return true;
+#endif
+    comm.setClient(&cell_client);
+    return false;
+}
+
 void setup() {
     bool has_been_configured = true;
     init_watchdog();
     g_wake_start_ms = millis();
     rtc_persist_boot();
+    comm.setClient(&cell_client);
     if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {
         load_device_params();
     }
@@ -2078,11 +2205,11 @@ void setup() {
 
     Serial.println(ESP.getEfuseMac());
  
-    // Panic and watchdog resets keep the queue. Force one OTA check.
     if (rtc_reset_was_panic()) {
         local_logger("Panic or watchdog reset. Forcing OTA rescue.");
-        init_network(MODEM_NETWORK_LTE, false);
-        check_for_firmware_update(true);
+        if (connect_uplink(false)) {
+            check_for_firmware_update(true);
+        }
         rtc_panic_flag = 0;
         rtc_persist_commit();
     }
@@ -2092,7 +2219,6 @@ void setup() {
     readingCnt++;
 
     if (first_run) {
-        // Delay to install the station.
         delay(30000);
         feed_watchdog();
     }    
@@ -2102,30 +2228,18 @@ void setup() {
     init_relay();
     feed_watchdog();
 
-    // Rain reset is decided from the stored local day, never from first_run.
-
     if (first_run || readingCnt >= (int)READING_COUNT) {
         feed_watchdog();
-
-        local_logger("Initializing Network Try 1 LTE");
-        result = init_network(MODEM_NETWORK_LTE, first_run);
-        feed_watchdog();
-        
-        if (!result) {            
-            local_logger("Initializing Network Try 2 LTE");
-            result = init_network(MODEM_NETWORK_AUTO, first_run);
-            feed_watchdog();
-            if (!result) {
-                local_logger("Initializing Network Try 1 GSM");
-                result = init_network(MODEM_NETWORK_GSM, first_run);
-                feed_watchdog();
-            }
-        }
+        result = connect_uplink(first_run);
         
         if (result) {
             check_for_firmware_update(false);
-
+#ifdef FEATURE_WIFI
+            if (comm.isWifi()) reliable_time_sync_wifi();
+            else reliable_time_sync(modem);
+#else
             reliable_time_sync(modem);
+#endif
             feed_watchdog();
 
             if (first_run) {

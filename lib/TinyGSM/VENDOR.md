@@ -18,4 +18,4 @@ No separate local delta could be extracted from the 3.0.0 import: the snapshot i
 
 - `https_get_size()` waits at most 20 seconds instead of 120. The A7608 `waitResponse` loop calls `TINY_GSM_YIELD()`, which the firmware defines to feed the task watchdog.
 
-The N/S and E/W GPS sign is still ignored in `TinyGsmClientA7608.h`. That fix is scheduled for v3.2.0.
+The N/S and E/W GPS sign is applied in `TinyGsmClientA7608.h` (v3.2.0). South and west readings are stored as negative degrees. The diff is `patches/v3.2.0-gps-sign.patch`.
