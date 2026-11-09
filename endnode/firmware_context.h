@@ -20,6 +20,7 @@
 #else
 #include "secrets.example.h"
 #endif
+#include "firmware_update_request.h"
 #ifndef CHECK_FIRMWARE_KEY
 #define CHECK_FIRMWARE_KEY ""
 #endif
@@ -70,7 +71,6 @@ extern const char* client_id_prefix;
 extern const uint8_t client_index;
 extern String publish_topic_prefix;
 extern String subscribe_topic_prefix;
-extern const char* CHECK_FIRMWARE_UPDATE_URL;
 extern const char* CONFIGURATION_SERVER_URL;
 extern const uint32_t OTA_TIMEOUT;
 extern unsigned long CHECK_FIRMWARE_UPDATE;

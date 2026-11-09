@@ -1,5 +1,6 @@
 #include "csv_parse.h"
 #include "daily_log.h"
+#include "firmware_update_request.h"
 #include "gps_policy.h"
 #include "network_policy.h"
 #include "ota_verify.h"
@@ -389,6 +390,356 @@ static void test_first_boot_takes_a_gps_fix() {
            "no modem and no cache is skipped");
 }
 
+struct UpdateCheckFields {
+    bool has_client_id;
+    bool has_device_type;
+    bool has_variant;
+    bool has_firmware_version;
+    bool has_device_id;
+    char client_id[80];
+    char variant[32];
+    char device_id[32];
+    long device_type;
+    long firmware_version;
+};
+
+struct JsonScan {
+    const char* p;
+    bool failed;
+};
+
+static void json_skip(JsonScan* j) {
+    while (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r') {
+        j->p++;
+    }
+}
+
+static bool json_string(JsonScan* j, char* out, size_t out_len) {
+    if (*j->p != '"') {
+        j->failed = true;
+        return false;
+    }
+    j->p++;
+    size_t n = 0;
+    while (*j->p && *j->p != '"') {
+        unsigned char c = (unsigned char)*j->p++;
+        if (c == '\\') {
+            char escaped = *j->p;
+            if (!escaped) {
+                j->failed = true;
+                return false;
+            }
+            j->p++;
+            switch (escaped) {
+            case '"':
+            case '\\':
+            case '/':
+                c = (unsigned char)escaped;
+                break;
+            case 'b': c = '\b'; break;
+            case 'f': c = '\f'; break;
+            case 'n': c = '\n'; break;
+            case 'r': c = '\r'; break;
+            case 't': c = '\t'; break;
+            case 'u':
+                for (int i = 0; i < 4; i++) {
+                    char hex = *j->p++;
+                    bool digit = (hex >= '0' && hex <= '9') || (hex >= 'a' && hex <= 'f') || (hex >= 'A' && hex <= 'F');
+                    if (!digit) {
+                        j->failed = true;
+                        return false;
+                    }
+                }
+                c = '?';
+                break;
+            default:
+                j->failed = true;
+                return false;
+            }
+        } else if (c < 0x20) {
+            j->failed = true;
+            return false;
+        }
+        if (out) {
+            if (n + 1 >= out_len) {
+                j->failed = true;
+                return false;
+            }
+            out[n++] = (char)c;
+        }
+    }
+    if (*j->p != '"') {
+        j->failed = true;
+        return false;
+    }
+    j->p++;
+    if (out) {
+        out[n] = '\0';
+    }
+    return true;
+}
+
+static bool json_number(JsonScan* j, long* value, bool* is_int) {
+    const char* start = j->p;
+    if (*j->p == '-') {
+        j->p++;
+    }
+    if (*j->p == '0') {
+        j->p++;
+    } else if (*j->p >= '1' && *j->p <= '9') {
+        while (*j->p >= '0' && *j->p <= '9') {
+            j->p++;
+        }
+    } else {
+        j->failed = true;
+        return false;
+    }
+    bool integral = true;
+    if (*j->p == '.') {
+        integral = false;
+        j->p++;
+        if (*j->p < '0' || *j->p > '9') {
+            j->failed = true;
+            return false;
+        }
+        while (*j->p >= '0' && *j->p <= '9') {
+            j->p++;
+        }
+    }
+    if (*j->p == 'e' || *j->p == 'E') {
+        integral = false;
+        j->p++;
+        if (*j->p == '+' || *j->p == '-') {
+            j->p++;
+        }
+        if (*j->p < '0' || *j->p > '9') {
+            j->failed = true;
+            return false;
+        }
+        while (*j->p >= '0' && *j->p <= '9') {
+            j->p++;
+        }
+    }
+    if (is_int) {
+        *is_int = integral;
+    }
+    if (value && integral) {
+        long parsed = 0;
+        bool negative = *start == '-';
+        const char* digit = negative ? start + 1 : start;
+        while (digit < j->p) {
+            parsed = parsed * 10 + (*digit - '0');
+            digit++;
+        }
+        *value = negative ? -parsed : parsed;
+    }
+    return true;
+}
+
+static bool json_literal(JsonScan* j, const char* literal) {
+    size_t length = strlen(literal);
+    if (strncmp(j->p, literal, length) != 0) {
+        j->failed = true;
+        return false;
+    }
+    j->p += length;
+    return true;
+}
+
+static bool json_skip_value(JsonScan* j);
+
+static bool json_object(JsonScan* j, UpdateCheckFields* fields, bool capture) {
+    if (*j->p != '{') {
+        j->failed = true;
+        return false;
+    }
+    j->p++;
+    json_skip(j);
+    if (*j->p == '}') {
+        j->p++;
+        return true;
+    }
+    for (;;) {
+        char key[40];
+        json_skip(j);
+        if (!json_string(j, key, sizeof(key))) {
+            return false;
+        }
+        json_skip(j);
+        if (*j->p != ':') {
+            j->failed = true;
+            return false;
+        }
+        j->p++;
+        json_skip(j);
+        bool taken = false;
+        if (capture && fields) {
+            if (strcmp(key, "client_id") == 0 && *j->p == '"') {
+                if (fields->has_client_id || !json_string(j, fields->client_id, sizeof(fields->client_id))) {
+                    j->failed = true;
+                    return false;
+                }
+                fields->has_client_id = true;
+                taken = true;
+            } else if (strcmp(key, "variant") == 0 && *j->p == '"') {
+                if (fields->has_variant || !json_string(j, fields->variant, sizeof(fields->variant))) {
+                    j->failed = true;
+                    return false;
+                }
+                fields->has_variant = true;
+                taken = true;
+            } else if (strcmp(key, "device_id") == 0 && *j->p == '"') {
+                if (fields->has_device_id || !json_string(j, fields->device_id, sizeof(fields->device_id))) {
+                    j->failed = true;
+                    return false;
+                }
+                fields->has_device_id = true;
+                taken = true;
+            } else if (strcmp(key, "device_type") == 0 && (*j->p == '-' || (*j->p >= '0' && *j->p <= '9'))) {
+                bool integral = false;
+                long value = 0;
+                if (fields->has_device_type || !json_number(j, &value, &integral)) {
+                    j->failed = true;
+                    return false;
+                }
+                if (integral) {
+                    fields->device_type = value;
+                    fields->has_device_type = true;
+                }
+                taken = true;
+            } else if (strcmp(key, "firmware_version") == 0 && (*j->p == '-' || (*j->p >= '0' && *j->p <= '9'))) {
+                bool integral = false;
+                long value = 0;
+                if (fields->has_firmware_version || !json_number(j, &value, &integral)) {
+                    j->failed = true;
+                    return false;
+                }
+                if (integral) {
+                    fields->firmware_version = value;
+                    fields->has_firmware_version = true;
+                }
+                taken = true;
+            }
+        }
+        if (!taken && !json_skip_value(j)) {
+            return false;
+        }
+        json_skip(j);
+        if (*j->p == ',') {
+            j->p++;
+            continue;
+        }
+        if (*j->p == '}') {
+            j->p++;
+            return true;
+        }
+        j->failed = true;
+        return false;
+    }
+}
+
+static bool json_array(JsonScan* j) {
+    if (*j->p != '[') {
+        j->failed = true;
+        return false;
+    }
+    j->p++;
+    json_skip(j);
+    if (*j->p == ']') {
+        j->p++;
+        return true;
+    }
+    for (;;) {
+        if (!json_skip_value(j)) {
+            return false;
+        }
+        json_skip(j);
+        if (*j->p == ',') {
+            j->p++;
+            continue;
+        }
+        if (*j->p == ']') {
+            j->p++;
+            return true;
+        }
+        j->failed = true;
+        return false;
+    }
+}
+
+static bool json_skip_value(JsonScan* j) {
+    json_skip(j);
+    if (*j->p == '"') {
+        return json_string(j, NULL, 0);
+    }
+    if (*j->p == '-' || (*j->p >= '0' && *j->p <= '9')) {
+        return json_number(j, NULL, NULL);
+    }
+    if (*j->p == '{') {
+        return json_object(j, NULL, false);
+    }
+    if (*j->p == '[') {
+        return json_array(j);
+    }
+    if (*j->p == 't') {
+        return json_literal(j, "true");
+    }
+    if (*j->p == 'f') {
+        return json_literal(j, "false");
+    }
+    if (*j->p == 'n') {
+        return json_literal(j, "null");
+    }
+    j->failed = true;
+    return false;
+}
+
+static bool parse_update_check_body(const char* json, UpdateCheckFields* fields) {
+    memset(fields, 0, sizeof(*fields));
+    if (!json) {
+        return false;
+    }
+    JsonScan scan = {json, false};
+    json_skip(&scan);
+    if (!json_object(&scan, fields, true) || scan.failed) {
+        return false;
+    }
+    json_skip(&scan);
+    return *scan.p == '\0' && !scan.failed;
+}
+
+static void test_firmware_update_body_is_json() {
+    const char* client_id = "A7608-S3-01-005";
+    const uint64_t device_id = 0xA1B2C3D4E5F6ULL;
+    char device_text[32];
+    snprintf(device_text, sizeof(device_text), "%llu", (unsigned long long)device_id);
+
+    char body[256];
+    int length = firmware_update_request_body(body, sizeof(body), client_id, 2, "cell", 400, device_id);
+    expect(length > 0, "cell update body fits");
+    UpdateCheckFields fields;
+    expect(parse_update_check_body(body, &fields), "cell update body parses");
+    expect(fields.has_client_id && strcmp(fields.client_id, client_id) == 0, "client_id");
+    expect(fields.has_device_type && fields.device_type == 2, "device_type");
+    expect(fields.has_variant && strcmp(fields.variant, "cell") == 0, "variant");
+    expect(fields.has_firmware_version && fields.firmware_version == 400, "firmware_version");
+    expect(fields.has_device_id && strcmp(fields.device_id, device_text) == 0, "device_id");
+
+    length = firmware_update_request_body(body, sizeof(body), client_id, 3, "wifi", 400, device_id);
+    expect(length > 0, "wifi update body fits");
+    expect(parse_update_check_body(body, &fields), "wifi update body parses");
+    expect(fields.has_variant && strcmp(fields.variant, "wifi") == 0, "wifi variant");
+    expect(fields.has_device_type && fields.device_type == 3, "wifi device_type");
+
+    const char* broken =
+        "{\"client_id\": \"A7608-S3-01-005\", \"device_type\":2, \"variant\":\"cell, \"firmware_version\":400, \"device_id\": \"1\"}";
+    expect(!parse_update_check_body(broken, &fields), "missing variant quote is not json");
+
+    expect(strcmp(CHECK_FIRMWARE_UPDATE_URL,
+                  "https://junkzqt2yc.execute-api.us-east-1.amazonaws.com/pro/device_firmware_config") == 0,
+           "default firmware update url");
+}
+
 static void test_missing_signature_rejects_ota() {
     const char* sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const char* other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
@@ -423,6 +774,7 @@ int main() {
     test_first_boot_takes_a_gps_fix();
     test_gps_time_budget();
     test_missing_signature_rejects_ota();
+    test_firmware_update_body_is_json();
     test_daily_log_and_health();
     if (failures) {
         printf("%d failed\n", failures);
