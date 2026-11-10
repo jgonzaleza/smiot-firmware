@@ -9,7 +9,9 @@
 #include "ota_guard.h"
 #include "queue_manager.h"
 #include "daily_log.h"
+#include "wake_policy.h"
 #include <ArduinoJson.h>
+#include <esp_system.h>
 
 static void sync_clock() {
 #ifdef FEATURE_WIFI
@@ -20,9 +22,21 @@ static void sync_clock() {
 #endif
 }
 
+static void recover_if_uplink_stale() {
+    uint32_t now = (uint32_t)get_current_timestamp();
+    if (!uplink_absent_for(now, last_uplink_unix, UPLINK_STALE_SEC)) return;
+    local_logger("No uplink for 2 hours. Resetting RTC and restarting onto the first_run path.");
+    spillover_rtc_to_sd();
+    radio_skip_clear(&radio_skip_remaining);
+    last_uplink_unix = now;
+    persist_reset_defaults();
+    esp_restart();
+}
+
 void boot_start(WakeState& wake) {
     wake.configured = true;
     wake.uplink = false;
+    wake.radio_skipped = false;
     init_watchdog();
     g_wake_start_ms = millis();
     rtc_persist_boot();
@@ -44,6 +58,7 @@ void boot_start(WakeState& wake) {
     gpio_deep_sleep_hold_dis();
     pinMode(PIN_5V_EN, OUTPUT);
     digitalWrite(PIN_5V_EN, HIGH);
+    recover_if_uplink_stale();
 
     if (rtc_reset_was_panic()) {
         local_logger("Panic or watchdog reset. Forcing OTA rescue.");
@@ -80,12 +95,18 @@ void network_provision(WakeState& wake) {
 }
 
 bool network_transmit_if_needed(WakeState& wake) {
+    bool want_radio = !wake.uplink && readingCnt >= (int)READING_COUNT;
     bool allow_radio = active_power_mode != POWER_CRITICAL || announce_power_mode;
-    if (radio_skip_remaining > 0 && !announce_power_mode && !first_run) {
-        radio_skip_remaining--;
+    if (want_radio && allow_radio &&
+        radio_skip_this_wake(&radio_skip_remaining, announce_power_mode, first_run != 0)) {
         allow_radio = false;
+        daily_log_net_reason("skip");
+    } else if (want_radio && !allow_radio) {
+        daily_log_net_reason("critical");
     }
-    if (!wake.uplink && allow_radio && readingCnt >= (int)READING_COUNT) {
+    bool attempted = false;
+    if (want_radio && allow_radio) {
+        attempted = true;
         init_modem();
         wake.uplink = connect_uplink(false);
         if (wake.uplink) {
@@ -94,6 +115,7 @@ bool network_transmit_if_needed(WakeState& wake) {
             wake.gps = gps_sample(true, false);
         }
     }
+    wake.radio_skipped = want_radio && !attempted;
     return wake.uplink;
 }
 
@@ -123,25 +145,32 @@ void deliver_sample(WakeState& wake) {
         local_logger("Reading count reached. Starting the transmit phase...");
         bool sent = false;
         if (wake.uplink) sent = send_all_queued_data();
-        if (sent) {
+        RadioSkipAccount radio;
+        radio.skip_remaining = radio_skip_remaining;
+        radio.consecutive_failures = consecutive_upload_failures;
+        RadioAccountKind kind = account_radio_wake(&radio, sent, wake.radio_skipped, MAX_CONSECUTIVE_FAILURES);
+        radio_skip_remaining = radio.skip_remaining;
+        consecutive_upload_failures = radio.consecutive_failures;
+        if (kind == RADIO_ACCOUNT_SUCCESS) {
             readingCnt = 0;
-            consecutive_upload_failures = 0;
             note_uplink_success();
+            uint32_t now = (uint32_t)get_current_timestamp();
+            if (now != 0) last_uplink_unix = now;
             local_logger("Transmit phase completed.");
-            ota_confirm_image();
+        } else if (kind == RADIO_ACCOUNT_SKIPPED) {
+            local_logger("Radio skipped. This wake does not count as an upload failure.");
+            feed_watchdog();
         } else {
             local_logger("Transmit failed. The readings stay stored locally.");
             feed_watchdog();
-            consecutive_upload_failures++;
             note_uplink_failure();
             daily_log_note_net_fail();
-            if (consecutive_upload_failures >= 3) radio_skip_remaining = 3;
-            if (consecutive_upload_failures >= MAX_CONSECUTIVE_FAILURES) {
-                local_logger("Too many consecutive send failures. Restarting.");
-                consecutive_upload_failures = 0;
-                consecutive_network_changes = 0;
-                perform_restart();
-            }
+        }
+        ota_account_uplink(first_run != 0, kind == RADIO_ACCOUNT_SUCCESS);
+        if (kind == RADIO_ACCOUNT_RESTART) {
+            local_logger("Too many consecutive send failures. Restarting.");
+            consecutive_network_changes = 0;
+            perform_restart();
         }
     } else {
         local_logger("Reading stored. Intermediate low-power cycle (", readingCnt, "/", READING_COUNT, ").");

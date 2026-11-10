@@ -38,7 +38,7 @@ void rtc_persist_commit() {
     g_rtc.crc = persist_crc_now();
 }
 
-static void persist_reset_defaults() {
+void persist_reset_defaults() {
     memset(&g_rtc, 0, sizeof(g_rtc));
     g_rtc.magic = RTC_PERSIST_MAGIC;
     g_rtc.is_first_run = 1;

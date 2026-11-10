@@ -13,6 +13,42 @@ RTC_DATA_ATTR DailyHealth g_daily_health = {
 };
 
 RTC_DATA_ATTR int smiot_log_level = LOG_INFO;
+RTC_DATA_ATTR char g_last_net_err[24] = "";
+
+static NetStepTrace g_net_trace = {-1, -1, -1, -1, -1, ""};
+
+static void net_reason_copy(char* dst, size_t dst_len, const char* reason) {
+    if (!dst || dst_len == 0) return;
+    size_t n = 0;
+    if (reason) {
+        for (; reason[n] && n + 1 < dst_len; n++) {
+            char c = reason[n];
+            if (c == ',' || c == '\n' || c == '\r' || c == ' ') c = '_';
+            dst[n] = c;
+        }
+    }
+    dst[n] = '\0';
+}
+
+void daily_log_net_at(int ok) { g_net_trace.at = ok; }
+void daily_log_net_sim(int ready) { g_net_trace.sim = ready; }
+void daily_log_net_reg(int status) { g_net_trace.reg = status; }
+void daily_log_net_open(int ok) { g_net_trace.netopen = ok; }
+void daily_log_net_ip(int has_ip) { g_net_trace.ip = has_ip; }
+
+void daily_log_net_reason(const char* reason) {
+    if (!reason || !reason[0]) return;
+    net_reason_copy(g_net_trace.reason, sizeof(g_net_trace.reason), reason);
+    net_reason_copy(g_last_net_err, sizeof(g_last_net_err), reason);
+}
+
+void daily_log_net_clear_reason() {
+    g_net_trace.reason[0] = '\0';
+}
+
+const NetStepTrace* daily_log_net_trace() {
+    return &g_net_trace;
+}
 
 static int32_t health_today() {
     uint32_t now = (uint32_t)get_current_timestamp();
@@ -156,6 +192,8 @@ void attach_daily_health(JsonDocument& doc) {
     health["sd"] = is_sdcard_ok ? 1 : 0;
     health["iccid"] = sim_iccid;
     health["idx"] = current_network_index;
+    health["last_net_err"] = g_last_net_err;
+    health["skip"] = radio_skip_remaining;
     g_daily_health.sent_day = today;
 }
 
@@ -165,7 +203,7 @@ void write_daily_wake_log() {
 
     bool error = !is_sdcard_ok || g_daily_health.net_fail > 0 || g_daily_health.gps_fail > 0 ||
         g_daily_health.sd_err > 0 || g_daily_health.wdt > 0 || g_daily_health.rst_panic > 0 ||
-        active_power_mode == POWER_CRITICAL;
+        active_power_mode == POWER_CRITICAL || g_net_trace.reason[0] != '\0';
     bool warn = active_power_mode == POWER_LOW || (last_rssi >= 0 && last_rssi < 8);
     uint32_t elapsed = 0;
     if (g_wake_start_ms > 0 && millis() >= g_wake_start_ms) elapsed = (millis() - g_wake_start_ms) / 1000UL;
@@ -195,8 +233,14 @@ void write_daily_wake_log() {
     fields.gps_fail = g_daily_health.gps_fail;
     fields.sd_err = g_daily_health.sd_err;
     fields.awake_sec = g_daily_health.awake_sec + elapsed;
+    fields.net_at = g_net_trace.at;
+    fields.net_sim = g_net_trace.sim;
+    fields.net_reg = g_net_trace.reg;
+    fields.net_open = g_net_trace.netopen;
+    fields.net_ip = g_net_trace.ip;
+    fields.net_err = g_net_trace.reason;
 
-    char line[192];
+    char line[224];
     if (format_wake_log(&fields, line, sizeof(line)) < 0) {
         add_sd_error("[DAILY_LOG_FORMAT]");
         health_add_awake(&g_daily_health, elapsed);

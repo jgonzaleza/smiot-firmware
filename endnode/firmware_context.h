@@ -51,6 +51,7 @@ extern int max_backlog_batches;
 extern String configured_apn;
 extern bool configured_apn_set;
 extern uint8_t radio_skip_remaining;
+extern uint32_t last_uplink_unix;
 extern uint8_t gps_fail_streak;
 extern int saved_power_mode;
 extern float last_pack_volts;
