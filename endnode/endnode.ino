@@ -1,5 +1,5 @@
 /**
- * Smart IoT End Node Firmware v200
+ * Smart IoT End Node Firmware 4.0.1
  * Board: Lilygo A7608X-S3
  * Flow: Init -> HTTPS Config/Update -> Read Sensors  -> MQTT Upload -> Store RTC( SD optional) -> Deep Sleep
  * Date: Junio 2026
@@ -18,6 +18,8 @@
  *                    Add support for network timeouts during firmware updates.
  * Change Log: v310 - RTC state survives resets. Queue bounds, MQTT parameter clamps,
  *                    watchdog deadlines, crash-safe SD offset, error ring.
+ * Change Log: 4.0.1 - Deep-sleep modem bring-up, radio-skip accounting,
+ *                    confirm after two sleep uplinks, network step log.
  */
 
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
@@ -41,6 +43,7 @@
 #include "param_flags.h"
 #include "power_policy.h"
 #include "sketch_config.h"
+#include "wake_policy.h"
 #include "variant.h"
 
 // External Libraries
@@ -206,6 +209,7 @@ int max_backlog_batches = 2;
 String configured_apn = "";
 bool configured_apn_set = false;
 RTC_DATA_ATTR uint8_t radio_skip_remaining = 0;
+RTC_DATA_ATTR uint32_t last_uplink_unix = 0;
 RTC_DATA_ATTR uint8_t gps_fail_streak = 0;
 RTC_DATA_ATTR int saved_power_mode = POWER_NORMAL;
 float last_pack_volts = -1;
@@ -320,6 +324,7 @@ void set_mqtt_subscription() {
 
 // Restart Function
 void perform_restart() {
+    radio_skip_clear(&radio_skip_remaining);
 
     // Before restarting, we want to make sure we spillover any remaining data in the RTC to the SD card to avoid data loss, 
     // if the SD card is working properly. This is especially important in case of a panic reset (watchdog timeout) 

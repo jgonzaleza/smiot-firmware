@@ -56,6 +56,9 @@ extern RTC_NOINIT_ATTR RtcPersist g_rtc;
 
 void rtc_persist_boot();
 void rtc_persist_commit();
+// Wipes RTC persist, including the payload pool, and sets first_run.
+// Spill the pool to the SD card first when the readings must survive.
+void persist_reset_defaults();
 bool rtc_persist_was_valid();
 bool rtc_reset_was_panic();
 uint32_t payload_hash32(const uint8_t* data, uint32_t len);

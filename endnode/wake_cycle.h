@@ -4,6 +4,7 @@
 struct WakeState {
     bool configured = true;
     bool uplink = false;
+    bool radio_skipped = false;
     String sensors;
     String gps;
 };

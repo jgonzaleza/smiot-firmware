@@ -8,6 +8,7 @@
 #include "power_policy.h"
 #include "queue_pool.h"
 #include "sketch_config.h"
+#include "wake_policy.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -322,6 +323,105 @@ static void test_daily_log_and_health() {
     expect(strstr(line, "89464278206109010629") != NULL, "wake line has the cleaned iccid");
     expect(strstr(line, "71204") != NULL, "wake line has the plmn");
     expect(strchr(line, '\n') == NULL, "wake line is one record");
+
+    fields.net_at = 1;
+    fields.net_sim = 0;
+    fields.net_reg = -1;
+    fields.net_open = -1;
+    fields.net_ip = -1;
+    fields.net_err = "sim timeout";
+    expect(format_wake_log(&fields, line, sizeof(line)) > 0, "network step line fits");
+    expect(strstr(line, ",1,0,-1,-1,-1,sim_timeout") != NULL, "wake line has modem steps and the reason");
+    expect(strchr(line, '\n') == NULL, "network step line is one record");
+}
+
+static void test_radio_skip_accounting() {
+    RadioSkipAccount state;
+    memset(&state, 0, sizeof(state));
+    expect(account_radio_wake(&state, false, false, 12) == RADIO_ACCOUNT_FAILURE, "first failure");
+    expect(state.consecutive_failures == 1 && state.skip_remaining == 0, "one failure does not skip");
+    expect(account_radio_wake(&state, false, false, 12) == RADIO_ACCOUNT_FAILURE, "second failure");
+    expect(account_radio_wake(&state, false, false, 12) == RADIO_ACCOUNT_FAILURE, "third failure");
+    expect(state.consecutive_failures == 3 && state.skip_remaining == RADIO_SKIP_CAP, "third failure caps the skip at 3");
+
+    expect(radio_skip_this_wake(&state.skip_remaining, false, false), "skip wake 1");
+    expect(state.skip_remaining == 2, "skip consumed once");
+    int32_t failures_before = state.consecutive_failures;
+    expect(account_radio_wake(&state, false, true, 12) == RADIO_ACCOUNT_SKIPPED, "skipped wake");
+    expect(state.consecutive_failures == failures_before, "skip does not add an upload failure");
+    expect(state.skip_remaining == 2, "skip does not arm another skip");
+
+    expect(radio_skip_this_wake(&state.skip_remaining, false, false), "skip wake 2");
+    expect(radio_skip_this_wake(&state.skip_remaining, false, false), "skip wake 3");
+    expect(state.skip_remaining == 0, "three skip wakes are the cap");
+    expect(!radio_skip_this_wake(&state.skip_remaining, false, false), "the next wake uses the radio");
+
+    uint8_t high = 9;
+    expect(radio_skip_this_wake(&high, false, false), "a large skip is still a skip");
+    expect(high == 2, "a skip above 3 is capped and then consumed");
+
+    uint8_t announce = 3;
+    expect(!radio_skip_this_wake(&announce, true, false), "a mode announce still uses the radio");
+    expect(announce == 3, "announce does not consume the skip");
+    expect(!radio_skip_this_wake(&announce, false, true), "first_run still uses the radio");
+    expect(announce == 3, "first_run does not consume the skip");
+
+    state.skip_remaining = 3;
+    state.consecutive_failures = 4;
+    expect(account_radio_wake(&state, true, false, 12) == RADIO_ACCOUNT_SUCCESS, "uplink success");
+    expect(state.skip_remaining == 0 && state.consecutive_failures == 0, "success clears the skip and the failures");
+}
+
+static void test_radio_skip_clears_on_restart() {
+    RadioSkipAccount state;
+    memset(&state, 0, sizeof(state));
+    state.consecutive_failures = 11;
+    state.skip_remaining = 1;
+    expect(account_radio_wake(&state, false, false, 12) == RADIO_ACCOUNT_RESTART, "twelfth failure restarts");
+    expect(state.consecutive_failures == 0, "restart clears the failure count");
+    expect(state.skip_remaining == RADIO_SKIP_CAP, "the failure arms a skip before restart");
+    radio_skip_clear(&state.skip_remaining);
+    expect(state.skip_remaining == 0, "perform_restart clears radio_skip_remaining");
+}
+
+static void test_ota_confirm_counter() {
+    OtaConfirmAccount state;
+    memset(&state, 0, sizeof(state));
+    expect(account_ota_confirm(&state, true, true) == OTA_CONFIRM_NONE, "first_run send does not confirm");
+    expect(state.confirmed == 0 && state.deep_sleep_uplinks == 0 && state.wakes_without_uplink == 0,
+           "first_run send is not a deep-sleep uplink");
+    expect(account_ota_confirm(&state, false, true) == OTA_CONFIRM_NONE, "one deep-sleep uplink waits");
+    expect(state.deep_sleep_uplinks == 1 && state.confirmed == 0, "one deep-sleep uplink is stored");
+    expect(account_ota_confirm(&state, false, true) == OTA_CONFIRM_MARK, "second deep-sleep uplink confirms");
+    expect(state.confirmed == 1, "image is confirmed");
+    expect(account_ota_confirm(&state, false, false) == OTA_CONFIRM_NONE, "a confirmed image does not roll back");
+
+    OtaConfirmAccount missed;
+    memset(&missed, 0, sizeof(missed));
+    for (int i = 0; i < 5; i++) {
+        expect(account_ota_confirm(&missed, false, false) == OTA_CONFIRM_NONE, "five misses stay unconfirmed");
+    }
+    expect(missed.wakes_without_uplink == 5, "five wakes with no uplink");
+    expect(account_ota_confirm(&missed, false, false) == OTA_CONFIRM_ROLLBACK, "sixth miss rolls back");
+
+    OtaConfirmAccount recovered;
+    memset(&recovered, 0, sizeof(recovered));
+    account_ota_confirm(&recovered, false, false);
+    account_ota_confirm(&recovered, false, false);
+    expect(account_ota_confirm(&recovered, true, true) == OTA_CONFIRM_NONE, "a later first_run success does not confirm");
+    expect(recovered.wakes_without_uplink == 0, "an uplink clears the miss streak");
+    expect(recovered.deep_sleep_uplinks == 0, "first_run success adds no confirm credit");
+}
+
+static void test_uplink_stale_and_deep_sleep_modem() {
+    expect(!modem_wake_from_deep_sleep(3), "software restart is a cold modem boot");
+    expect(!modem_wake_from_deep_sleep(1), "power-on is a cold modem boot");
+    expect(modem_wake_from_deep_sleep(MODEM_RESET_REASON_DEEPSLEEP), "deep sleep probes AT before PWRKEY");
+    expect(!uplink_absent_for(0, 1000, UPLINK_STALE_SEC), "an unset clock does not force a reset");
+    expect(!uplink_absent_for(8000, 0, UPLINK_STALE_SEC), "no successful uplink yet does not force a reset");
+    expect(!uplink_absent_for(1000 + UPLINK_STALE_SEC - 1, 1000, UPLINK_STALE_SEC), "one second under 2 hours stays up");
+    expect(uplink_absent_for(1000 + UPLINK_STALE_SEC, 1000, UPLINK_STALE_SEC), "2 hours without an uplink resets");
+    expect(UPLINK_STALE_SEC == 7200, "the stale window is 2 hours");
 }
 
 static void test_rain_command_rising_edge() {
@@ -776,6 +876,10 @@ int main() {
     test_missing_signature_rejects_ota();
     test_firmware_update_body_is_json();
     test_daily_log_and_health();
+    test_radio_skip_accounting();
+    test_radio_skip_clears_on_restart();
+    test_ota_confirm_counter();
+    test_uplink_stale_and_deep_sleep_modem();
     if (failures) {
         printf("%d failed\n", failures);
         return 1;

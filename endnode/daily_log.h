@@ -36,6 +36,17 @@ struct DailyHealth {
     int16_t vmax_centi;
 };
 
+// One wake's modem steps. -1 means that step did not run.
+// reason is a short token with no comma: at_fail, sim_timeout, skip, ...
+struct NetStepTrace {
+    int at;
+    int sim;
+    int reg;
+    int netopen;
+    int ip;
+    char reason[24];
+};
+
 struct WakeLogFields {
     int level;
     uint32_t unix_time;
@@ -52,6 +63,12 @@ struct WakeLogFields {
     int gps_fail;
     int sd_err;
     uint32_t awake_sec;
+    int net_at;
+    int net_sim;
+    int net_reg;
+    int net_open;
+    int net_ip;
+    const char* net_err;
 };
 
 inline int daily_ci_equal(const char* a, const char* b) {
@@ -223,19 +240,29 @@ inline char log_level_letter(int level) {
     return 'I';
 }
 
-// level,unix,sim,iccid,plmn,idx,rssi,vmin_cv,vmax_cv,sd,queue,net_fail,gps_fail,sd_err,awake
+// level,unix,sim,iccid,plmn,idx,rssi,vmin_cv,vmax_cv,sd,queue,net_fail,gps_fail,sd_err,awake,at,simrdy,reg,netopen,ip,err
 inline int format_wake_log(const WakeLogFields* in, char* out, size_t out_len) {
     if (!in || !out || out_len < 8) return -1;
     const char* sim = (in->sim && in->sim[0]) ? in->sim : "-";
     const char* iccid = (in->iccid && in->iccid[0]) ? in->iccid : "-";
     const char* plmn = (in->plmn && in->plmn[0]) ? in->plmn : "-";
-    int n = snprintf(out, out_len, "%c,%lu,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%lu",
+    char err_buf[24];
+    const char* err_src = (in->net_err && in->net_err[0]) ? in->net_err : "-";
+    size_t ei = 0;
+    for (; err_src[ei] && ei + 1 < sizeof(err_buf); ei++) {
+        char c = err_src[ei];
+        if (c == ',' || c == '\n' || c == '\r' || c == ' ') c = '_';
+        err_buf[ei] = c;
+    }
+    err_buf[ei] = '\0';
+    int n = snprintf(out, out_len, "%c,%lu,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%lu,%d,%d,%d,%d,%d,%s",
         log_level_letter(in->level),
         (unsigned long)in->unix_time,
         sim, iccid, plmn,
         in->carrier_index, in->rssi, in->vmin_centi, in->vmax_centi, in->sd_present,
         in->queue_depth, in->net_fail, in->gps_fail, in->sd_err,
-        (unsigned long)in->awake_sec);
+        (unsigned long)in->awake_sec,
+        in->net_at, in->net_sim, in->net_reg, in->net_open, in->net_ip, err_buf);
     if (n < 0 || (size_t)n >= out_len) return -1;
     return n;
 }
@@ -248,4 +275,12 @@ void daily_log_note_voltage(float volts);
 void daily_log_set_level_text(const char* text);
 void daily_log_set_level_code(int level);
 int daily_log_level();
+void daily_log_net_at(int ok);
+void daily_log_net_sim(int ready);
+void daily_log_net_reg(int status);
+void daily_log_net_open(int ok);
+void daily_log_net_ip(int has_ip);
+void daily_log_net_reason(const char* reason);
+void daily_log_net_clear_reason();
+const NetStepTrace* daily_log_net_trace();
 void write_daily_wake_log();

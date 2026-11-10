@@ -11,7 +11,11 @@
 #include "csv_parse.h"
 #include "network_policy.h"
 #include "variant.h"
+#include "wake_policy.h"
+#include "daily_log.h"
 #include <string.h>
+#include <esp_sleep.h>
+#include <esp_system.h>
 #include <ModbusMaster.h>
 #include <ArduinoJson.h>
 #include <Update.h>
@@ -66,17 +70,47 @@ static void capture_registered_plmn() {
     local_logger("Registered PLMN: ", registered_plmn);
 }
 
+static void modem_reset_deassert() {
+#ifdef MODEM_RESET_PIN
+    gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
+    pinMode(MODEM_RESET_PIN, OUTPUT);
+    digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
+#endif
+}
+
+static void modem_hard_reset() {
+#ifdef MODEM_RESET_PIN
+    modem_reset_deassert();
+    delay(100);
+    digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL);
+    delay(2600);
+    digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
+#endif
+}
+
+// Board PWRKEY is active-high into a transistor, so a high pulse presses
+// the modem key. On the A7608 that key toggles power.
+static void modem_pwrkey_pulse() {
+    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+    delay(100);
+    digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+    delay(1000);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+}
+
+static bool modem_wait_at(int attempts) {
+    for (int i = 0; i < attempts; i++) {
+        feed_watchdog();
+        if (modem.testAT(1000)) return true;
+    }
+    return false;
+}
+
 void init_modem() {
     Serial.begin(115200); // Set console baud rate
 
     SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
-
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
-        #ifdef DEBUG
-            Serial.println("Wakeup timer");
-            Serial.println("Turn ON Modem!");
-        #endif
-    }
 
     gpio_hold_dis((gpio_num_t)PIN_5V_EN);
     gpio_hold_dis((gpio_num_t)RS485_EN_PIN);
@@ -84,41 +118,43 @@ void init_modem() {
     gpio_hold_dis((gpio_num_t)BOARD_SD_CS_PIN);
     gpio_deep_sleep_hold_dis();
 
-    #ifdef MODEM_RESET_PIN
-        gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
-        pinMode(MODEM_RESET_PIN, OUTPUT);
-        digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL); delay(100);
-        digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL); delay(2600);
-        digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
-    #endif
-
     pinMode(MODEM_DTR_PIN, OUTPUT);
     digitalWrite(MODEM_DTR_PIN, LOW);
-    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
-    digitalWrite(BOARD_PWRKEY_PIN, LOW);
-    delay(100);
-    digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-    delay(1000);
-    digitalWrite(BOARD_PWRKEY_PIN, LOW);
 
-    // Delay sometime ...
-    delay(1000);
-    #ifdef DEBUG
-        Serial.println("Checking if modem is online.");
-    #endif
-    int retry = 0;
-    int k = 50;
-    while (!modem.testAT(1000) && k > 0) {
-        k--;
-        if (retry++ > 10) {
-            digitalWrite(BOARD_PWRKEY_PIN, LOW);
-            delay(100);
-            digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-            delay(1000);
-            digitalWrite(BOARD_PWRKEY_PIN, LOW);
-            retry = 0;
+    // Deep-sleep wake: go_sleep() sends AT+CPOF and holds RESET deasserted.
+    // CPOF often does not finish, so the modem is still on. A RESET pulse
+    // plus a PWRKEY pulse toggles that modem off, and the wake never
+    // reaches getSimCCID. Probe AT with RESET left inactive. Pulse PWRKEY
+    // once only when AT is silent, then wait for boot with no second pulse.
+    // Cold boot and software restart keep the hard reset and power-on pulse.
+    // That is the path that works on the post-OTA first_run.
+    bool at_ok = false;
+    if (modem_wake_from_deep_sleep((int)esp_reset_reason())) {
+        modem_reset_deassert();
+        pinMode(BOARD_PWRKEY_PIN, OUTPUT);
+        digitalWrite(BOARD_PWRKEY_PIN, LOW);
+        at_ok = modem_wait_at(5);
+        if (!at_ok) {
+            modem_pwrkey_pulse();
+            at_ok = modem_wait_at(15);
+        }
+    } else {
+        modem_hard_reset();
+        modem_pwrkey_pulse();
+        delay(1000);
+        int retry = 0;
+        int k = 50;
+        while (!(at_ok = modem.testAT(1000)) && k > 0) {
+            feed_watchdog();
+            k--;
+            if (retry++ > 10) {
+                modem_pwrkey_pulse();
+                retry = 0;
+            }
         }
     }
+    daily_log_net_at(at_ok ? 1 : 0);
+    if (!at_ok) daily_log_net_reason("at_fail");
     modem_was_powered = true;
 
     //Put the Led Pin as Output
@@ -135,6 +171,14 @@ void init_modem() {
         Serial.println("#### Wakeup Completed ####");
     #endif
 }
+
+static bool net_deadline(unsigned long phase_start) {
+    if (!phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) return false;
+    daily_log_net_reason("deadline");
+    local_logger("init_network deadline");
+    return true;
+}
+
 bool init_network(NetworkMode mode_setup_value, bool show_status) {
     unsigned long phase_start = millis();
     // Check if SIM card is online
@@ -142,8 +186,8 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
     bool result = false;
     int k = 30;
     while ((sim != SIM_READY) && (k > 0)) {
-        if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
-            local_logger("init_network deadline");
+        if (net_deadline(phase_start)) {
+            daily_log_net_sim(0);
             return false;
         }
         k--;
@@ -170,11 +214,14 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
     }
 
     if (sim != SIM_READY) {
+        daily_log_net_sim(0);
+        daily_log_net_reason(sim == SIM_LOCKED ? "sim_locked" : "sim_timeout");
         if (show_status) {
             blink_led(255, 0, 0, 10000);
         }
         return result;
     }
+    daily_log_net_sim(1);
 
     if (!modem.setNetworkMode(mode_setup_value)) {
         local_logger("Set network mode failed!");
@@ -265,8 +312,8 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
     RegStatus status = REG_NO_RESULT;
     k = 60;
     while ((status == REG_NO_RESULT || status == REG_SEARCHING || status == REG_UNREGISTERED) && (k > 0)) {
-        if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
-            local_logger("init_network deadline");
+        if (net_deadline(phase_start)) {
+            daily_log_net_reg((int)status);
             return false;
         }
         k--;
@@ -299,6 +346,8 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
                 break;
             case REG_DENIED:
                 local_logger("Network registration was rejected, please check if the APN is correct");
+                daily_log_net_reg((int)status);
+                daily_log_net_reason("reg_denied");
                 return false;
             case REG_OK_HOME:
                 local_logger("Online registration successful");                
@@ -319,6 +368,8 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
 
     if (status == REG_NO_RESULT || status == REG_SEARCHING || status == REG_UNREGISTERED) {
         local_logger("REGISTRATION FAILED!");
+        daily_log_net_reg((int)status);
+        daily_log_net_reason("reg_fail");
         if (show_status) {
             blink_led(255, 0, 0, 10000);
         }
@@ -327,6 +378,7 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
         return result;
     }
 
+    daily_log_net_reg((int)status);
     local_logger("Registration Status: ", status);
     if (status == REG_OK_HOME || status == REG_OK_ROAMING) capture_registered_plmn();
     if (show_status) {
@@ -335,16 +387,19 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
 
     //For Roaming Enabling the network din't work. We use wait for network
     bool enable_network = false;
+    int netopen_seen = 0;
     String ipAddress = "";
     if (status != REG_OK_ROAMING && status != REG_EMERGENCY_ONLY) {
         k = 60;
         enable_network = modem.enableNetwork();
+        netopen_seen = enable_network ? 1 : 0;
         while (!enable_network && k > 0) {
-            if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
-                local_logger("init_network deadline");
+            if (net_deadline(phase_start)) {
+                daily_log_net_open(netopen_seen);
                 return false;
             }
             enable_network = modem.enableNetwork();
+            netopen_seen = enable_network ? 1 : 0;
             local_logger("Trying to enable network: ", k); 
             if (show_status) {
                 blink_led(0, 255, 0);
@@ -369,8 +424,8 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
         local_logger("TRY TO ENABLE NETWORK: ");
         k = 10;          
         while (ipAddress.isEmpty() && k > 0) {
-            if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
-                local_logger("init_network deadline");
+            if (net_deadline(phase_start)) {
+                daily_log_net_open(netopen_seen);
                 return false;
             }
             k--;
@@ -382,9 +437,10 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
             #endif                        
             int p = 5;
             bool enable_network = modem.enableNetwork();
+            netopen_seen = enable_network ? 1 : 0;
             while (!enable_network && p > 0) {
-                if (phase_deadline_hit(phase_start, NET_PHASE_BUDGET_MS)) {
-                    local_logger("init_network deadline");
+                if (net_deadline(phase_start)) {
+                    daily_log_net_open(netopen_seen);
                     return false;
                 }
                 p--;
@@ -397,6 +453,7 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
                     Serial.println("");
                 #endif                
                 enable_network = modem.enableNetwork();
+                netopen_seen = enable_network ? 1 : 0;
                 Serial.println("");
                 delay(1000);                
             }
@@ -422,6 +479,10 @@ bool init_network(NetworkMode mode_setup_value, bool show_status) {
     }
 
     result = !ipAddress.isEmpty();
+    daily_log_net_open(netopen_seen);
+    daily_log_net_ip(result ? 1 : 0);
+    if (result) daily_log_net_clear_reason();
+    else daily_log_net_reason(netopen_seen ? "no_ip" : "netopen_fail");
 
     #ifdef DEBUG
         if (result) {
@@ -493,17 +554,22 @@ bool connect_uplink(bool show_status) {
     bool prefer_wifi = (g_rtc.last_transport == 1 && g_rtc.wakes_since_cell < CELL_RETRY_EVERY);
     if (prefer_wifi && use_wifi_client()) return true;
 #endif
-    local_logger("Initializing Network Try 1 LTE");
-    bool ok = init_network(MODEM_NETWORK_LTE, show_status);
-    feed_watchdog();
-    if (!ok) {
-        local_logger("Initializing Network Try 2 LTE");
-        ok = init_network(MODEM_NETWORK_AUTO, show_status);
+    bool ok = false;
+    if (daily_log_net_trace()->at == 0) {
+        local_logger("Modem did not answer AT. Skipping registration.");
+    } else {
+        local_logger("Initializing Network Try 1 LTE");
+        ok = init_network(MODEM_NETWORK_LTE, show_status);
         feed_watchdog();
         if (!ok) {
-            local_logger("Initializing Network Try 1 GSM");
-            ok = init_network(MODEM_NETWORK_GSM, show_status);
+            local_logger("Initializing Network Try 2 LTE");
+            ok = init_network(MODEM_NETWORK_AUTO, show_status);
             feed_watchdog();
+            if (!ok) {
+                local_logger("Initializing Network Try 1 GSM");
+                ok = init_network(MODEM_NETWORK_GSM, show_status);
+                feed_watchdog();
+            }
         }
     }
     if (ok) {
