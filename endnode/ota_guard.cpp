@@ -152,9 +152,9 @@ void ota_confirm_image() {
     prefs.end();
 }
 
-void ota_account_uplink(bool first_run, bool uplink_ok) {
+void ota_account_uplink(bool on_first_run, bool uplink_ok) {
     OtaConfirmAccount state = ota_load_account();
-    OtaConfirmKind kind = account_ota_confirm(&state, first_run, uplink_ok);
+    OtaConfirmKind kind = account_ota_confirm(&state, on_first_run, uplink_ok);
     ota_store_account(state);
     if (kind == OTA_CONFIRM_MARK) {
         local_logger("Two deep-sleep uplinks succeeded. Confirming this image.");

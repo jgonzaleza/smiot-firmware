@@ -34,10 +34,10 @@ enum RadioAccountKind {
 // True when this transmit wake must not touch the radio.
 // Caps the skip at 3, then consumes one. Does not re-arm it.
 // An announce wake and the post-OTA first_run wake still use the radio.
-inline bool radio_skip_this_wake(uint8_t* skip_remaining, bool announce_power_mode, bool first_run) {
+inline bool radio_skip_this_wake(uint8_t* skip_remaining, bool announce_power_mode, bool on_first_run) {
     if (!skip_remaining) return false;
     if (*skip_remaining > RADIO_SKIP_CAP) *skip_remaining = RADIO_SKIP_CAP;
-    if (*skip_remaining > 0 && !announce_power_mode && !first_run) {
+    if (*skip_remaining > 0 && !announce_power_mode && !on_first_run) {
         (*skip_remaining)--;
         return true;
     }
@@ -94,11 +94,11 @@ enum OtaConfirmKind {
 // of the two deep-sleep uplinks. Two later successes confirm. Six transmit
 // wakes with no uplink, while the image is still unconfirmed, roll back.
 // A success clears the miss streak. A confirmed image stays idle.
-inline OtaConfirmKind account_ota_confirm(OtaConfirmAccount* state, bool first_run, bool uplink_ok) {
+inline OtaConfirmKind account_ota_confirm(OtaConfirmAccount* state, bool on_first_run, bool uplink_ok) {
     if (!state || state->confirmed) return OTA_CONFIRM_NONE;
     if (uplink_ok) {
         state->wakes_without_uplink = 0;
-        if (first_run) return OTA_CONFIRM_NONE;
+        if (on_first_run) return OTA_CONFIRM_NONE;
         if (state->deep_sleep_uplinks < 255) state->deep_sleep_uplinks++;
         if (state->deep_sleep_uplinks >= OTA_CONFIRM_UPLINKS) {
             state->confirmed = 1;
