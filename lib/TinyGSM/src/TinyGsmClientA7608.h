@@ -472,6 +472,10 @@ class TinyGsmA7608 :    public TinyGsmA76xx<TinyGsmA7608>,
       TINY_GSM_YIELD();
       while (stream.available() > 0) {
         TINY_GSM_YIELD();
+        // A busy RX used to stay in this loop until the bytes stopped,
+        // so the timeout below never ran and the task watchdog was fed
+        // by TINY_GSM_YIELD. Return on the same rule as an empty UART.
+        if ((uint32_t)(millis() - startMillis) >= timeout_ms) goto finish;
         int8_t a = stream.read();
         // putchar(a);
         if (a <= 0) continue;  // Skip 0x00 bytes, just in case

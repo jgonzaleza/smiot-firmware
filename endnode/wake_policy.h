@@ -19,12 +19,43 @@ static const uint8_t OTA_ROLLBACK_MISSES = 6;
 static const uint32_t MODEM_OFF_MIN_SLEEP_SEC = 20;
 // Bound the power-off wait. v3 retried until AT died, without a cap.
 static const uint32_t MODEM_CPOF_BUDGET_MS = 15000;
-// Deep-sleep wake: AT up but no +CPIN: READY in this window means the
-// module is still in the CPOF tail. Cold-reset it.
+// Kept for the CPIN parser tests. Deep-sleep bring-up no longer waits
+// this long before resetting: a short sleep can leave AT up with no SIM.
 static const uint32_t MODEM_SIM_READY_MS = 10000;
-// Power-on pulse into the board transistor. 1000ms toggles an A7608
-// that is already on. Keep this inside the 100-500ms on-pulse.
-static const uint32_t MODEM_PWRKEY_ON_MS = 200;
+// v3 power-on pulse. 100-500ms turns an A7608 on from the off state.
+// 200ms is not used: on a module that is already on it neither resets
+// it nor turns it off.
+static const uint32_t MODEM_PWRKEY_ON_MS = 100;
+// v3 retry, and the press that turns an already-on module off.
+// About 1000ms toggles power on this board. The 2.5s spec off-press
+// is longer than the pulse that actually powers this A7608 down.
+static const uint32_t MODEM_PWRKEY_RETRY_MS = 1000;
+
+// Deep sleep always runs the v3 on-sequence, and only after the module
+// is off. AT still answering means the short sleep brought it back.
+enum DeepSleepBringup {
+    DEEP_SLEEP_ON_FROM_OFF = 0,
+    DEEP_SLEEP_FORCE_OFF = 1
+};
+
+inline int deep_sleep_bringup(bool at_answered) {
+    return at_answered ? DEEP_SLEEP_FORCE_OFF : DEEP_SLEEP_ON_FROM_OFF;
+}
+
+// An AT read returns when its timeout elapses. Bytes still sitting in
+// the UART do not extend that timeout.
+inline bool at_read_timed_out(uint32_t elapsed_ms, uint32_t timeout_ms, bool bytes_waiting) {
+    (void)bytes_waiting;
+    return elapsed_ms >= timeout_ms;
+}
+
+// First-boot waits (install delay, NTP, GPS) stop at the awake budget
+// instead of pushing the wake past the interval and into the 20s floor.
+inline uint32_t cap_wait_ms(uint32_t want_ms, uint32_t elapsed_ms, uint32_t budget_ms) {
+    if (elapsed_ms >= budget_ms) return 0;
+    uint32_t left = budget_ms - elapsed_ms;
+    return want_ms < left ? want_ms : left;
+}
 
 inline bool modem_wake_from_deep_sleep(int reset_reason) {
     return reset_reason == MODEM_RESET_REASON_DEEPSLEEP;
@@ -70,8 +101,8 @@ inline bool cpin_text_is_ready(const char* text) {
     return wake_text_find(mark, "READY") != 0 && wake_text_find(mark, "READY") < end;
 }
 
-// AT is up and the SIM did not become ready. The deep-sleep caller uses
-// this to take the cold reset instead of polling CPIN for the whole budget.
+// CPIN predicate only. Deep-sleep bring-up does not use it to skip the
+// reset: every deep-sleep wake powers on from a confirmed-off module.
 inline bool sim_not_ready_needs_cold_reset(bool at_answered, bool cpin_ready) {
     return at_answered && !cpin_ready;
 }

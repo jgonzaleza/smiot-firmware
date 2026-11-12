@@ -240,6 +240,21 @@ inline char log_level_letter(int level) {
     return 'I';
 }
 
+// Join the deep-sleep bring-up branch and the later failure. A forced
+// power-off that then hits the SIM deadline is "pwr_off+deadline".
+inline void compose_net_err(char* out, size_t out_len, const char* branch, const char* reason) {
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    int has_branch = branch && branch[0];
+    int has_reason = reason && reason[0];
+    if (has_branch && has_reason) {
+        snprintf(out, out_len, "%s+%s", branch, reason);
+        return;
+    }
+    if (has_branch) snprintf(out, out_len, "%s", branch);
+    else if (has_reason) snprintf(out, out_len, "%s", reason);
+}
+
 // level,unix,sim,iccid,plmn,idx,rssi,vmin_cv,vmax_cv,sd,queue,net_fail,gps_fail,sd_err,awake,at,simrdy,reg,netopen,ip,err
 inline int format_wake_log(const WakeLogFields* in, char* out, size_t out_len) {
     if (!in || !out || out_len < 8) return -1;
@@ -281,6 +296,7 @@ void daily_log_net_reg(int status);
 void daily_log_net_open(int ok);
 void daily_log_net_ip(int has_ip);
 void daily_log_net_reason(const char* reason);
+void daily_log_net_branch(const char* branch);
 void daily_log_net_clear_reason();
 const NetStepTrace* daily_log_net_trace();
 void write_daily_wake_log();

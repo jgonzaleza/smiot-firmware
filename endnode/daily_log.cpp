@@ -16,6 +16,7 @@ RTC_DATA_ATTR int smiot_log_level = LOG_INFO;
 RTC_DATA_ATTR char g_last_net_err[24] = "";
 
 static NetStepTrace g_net_trace = {-1, -1, -1, -1, -1, ""};
+static char g_net_branch[16] = "";
 
 static void net_reason_copy(char* dst, size_t dst_len, const char* reason) {
     if (!dst || dst_len == 0) return;
@@ -40,6 +41,10 @@ void daily_log_net_reason(const char* reason) {
     if (!reason || !reason[0]) return;
     net_reason_copy(g_net_trace.reason, sizeof(g_net_trace.reason), reason);
     net_reason_copy(g_last_net_err, sizeof(g_last_net_err), reason);
+}
+
+void daily_log_net_branch(const char* branch) {
+    net_reason_copy(g_net_branch, sizeof(g_net_branch), branch);
 }
 
 void daily_log_net_clear_reason() {
@@ -238,7 +243,9 @@ void write_daily_wake_log() {
     fields.net_reg = g_net_trace.reg;
     fields.net_open = g_net_trace.netopen;
     fields.net_ip = g_net_trace.ip;
-    fields.net_err = g_net_trace.reason;
+    char err_joined[24];
+    compose_net_err(err_joined, sizeof(err_joined), g_net_branch, g_net_trace.reason);
+    fields.net_err = err_joined;
 
     char line[224];
     if (format_wake_log(&fields, line, sizeof(line)) < 0) {

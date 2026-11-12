@@ -88,7 +88,12 @@ local_logger("Configuring Modem NTP:", server);
     // 3 = Match "+CNTP: 61" (DNS Error)
     
     local_logger("Waiting for NTP Result...");
-    int res = modem.waitResponse(20000L, "+CNTP: 0", "+CNTP: 1", "+CNTP: 61");
+    uint32_t ntp_wait = cap_awake_wait_ms(20000);
+    if (ntp_wait == 0) {
+        local_logger("Awake budget used. Skipping NTP.");
+        return false;
+    }
+    int res = modem.waitResponse(ntp_wait, "+CNTP: 0", "+CNTP: 1", "+CNTP: 61");
 
     if (res == 1) {
         local_logger("NTP Success (Refreshed)!");
@@ -108,6 +113,10 @@ local_logger("Configuring Modem NTP:", server);
 bool sync_via_ntp(TinyGsm& modem) {
     // Loop through all 4 servers
     for (int i = 0; i < 4; i++) {
+        if (awake_budget_expired()) {
+            local_logger("Awake budget used. Stopping NTP.");
+            return false;
+        }
         if (try_modem_ntp(modem, ntp_servers[i])) {
             
             // --- SUCCESS ---
@@ -236,18 +245,22 @@ unsigned long get_current_timestamp() {
 // Helper to actually do the network work
 void perform_full_sync(TinyGsm& modem) {
     bool synced = false;
-    
+    if (awake_budget_expired()) {
+        local_logger("Awake budget used. Skipping time sync.");
+        return;
+    }
+
     // Try NTP first (Most Accurate)
     if (sync_via_ntp(modem)) {
         local_logger("NTP Time Sync Successful");
         synced = true;
         current_time_source = TIME_NTP;
-    } else if (sync_via_network(modem)) {
+    } else if (!awake_budget_expired() && sync_via_network(modem)) {
         // Fallback to Network Time
         local_logger("Network Time Sync Successful");
         synced = true;
         current_time_source = TIME_NETWORK;
-    } else if (sync_via_modem(modem)) {
+    } else if (!awake_budget_expired() && sync_via_modem(modem)) {
         // Fallback to Modem Time
         local_logger("Modem Time Sync Successful");
         synced = true;
@@ -261,6 +274,8 @@ void perform_full_sync(TinyGsm& modem) {
         // Update the timestamp of "Last Good Sync"
         time_t t = time(NULL);
         last_sync_timestamp = (unsigned long)t;
+    } else if (awake_budget_expired()) {
+        local_logger("Awake budget used. Leaving the clock as it is.");
     } else {
         local_logger("Time Sync Failed. Try one more time.");
         if (sync_via_ntp(modem)) {

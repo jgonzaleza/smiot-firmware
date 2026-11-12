@@ -13,6 +13,7 @@
 #include "rtc_persist.h"
 #include "param_limits.h"
 #include "daily_log.h"
+#include "wake_policy.h"
 
 
 // 5 Minutes. If the board gets stuck for 5 mins without "feeding", it restarts.
@@ -90,6 +91,12 @@ extern unsigned long g_wake_start_ms;
 
 inline bool awake_budget_expired() {
     return (millis() - g_wake_start_ms) >= AWAKE_BUDGET_MS;
+}
+
+// How much of want_ms still fits in this wake. Zero once the budget is gone.
+inline uint32_t cap_awake_wait_ms(uint32_t want_ms) {
+    unsigned long elapsed = millis() - g_wake_start_ms;
+    return cap_wait_ms(want_ms, (uint32_t)elapsed, (uint32_t)AWAKE_BUDGET_MS);
 }
 
 // True when this phase, or the whole wake, has used its deadline.

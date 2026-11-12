@@ -10,6 +10,7 @@
 #include "queue_pool.h"
 #include "sketch_config.h"
 #include "wake_policy.h"
+#include "param_limits.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -462,7 +463,9 @@ static void test_sleep_floor_and_sim_reset() {
     expect(MODEM_OFF_MIN_SLEEP_SEC >= 20, "the floor gives the modem time to finish powering off");
     expect(MODEM_CPOF_BUDGET_MS >= 10000 && MODEM_CPOF_BUDGET_MS <= 20000, "CPOF retries until AT stops, with a bound");
     expect(MODEM_SIM_READY_MS >= 8000 && MODEM_SIM_READY_MS <= 12000, "CPIN is given about 10 seconds");
-    expect(MODEM_PWRKEY_ON_MS >= 100 && MODEM_PWRKEY_ON_MS <= 500, "the cold-reset PWRKEY pulse is an on-pulse");
+    expect(MODEM_PWRKEY_ON_MS == 100, "the v3 on-pulse is 100ms, not the 200ms press");
+    expect(MODEM_PWRKEY_ON_MS >= 100 && MODEM_PWRKEY_ON_MS <= 500, "the on-pulse stays in the power-on window");
+    expect(MODEM_PWRKEY_RETRY_MS == 1000, "the retry and the off-press are the 1000ms v3 retry");
 
     expect(cpin_text_is_ready("+CPIN: READY"), "CPIN READY is ready");
     expect(cpin_text_is_ready("\r\n+CPIN: READY\r\n\r\nOK\r\n"), "CPIN READY before OK is ready");
@@ -483,6 +486,36 @@ static void test_sleep_floor_and_sim_reset() {
     expect(!network_mode_retries_allowed(0), "a SIM that did not answer skips AUTO and GSM");
     expect(network_mode_retries_allowed(1), "a ready SIM can try the next mode");
     expect(network_mode_retries_allowed(-1), "a step that did not reach the SIM still retries");
+}
+
+static void test_confirmed_off_awake_cap_and_at_timeout() {
+    expect(deep_sleep_bringup(true) == DEEP_SLEEP_FORCE_OFF, "AT up after deep sleep is powered off before the v3 reset");
+    expect(deep_sleep_bringup(false) == DEEP_SLEEP_ON_FROM_OFF, "a silent modem is already off and takes the v3 on-sequence");
+    expect(MODEM_PWRKEY_RETRY_MS != MODEM_PWRKEY_ON_MS, "the retry is not the short on-pulse");
+
+    expect(!at_read_timed_out(999, 1000, true), "RX data does not end an AT read before the timeout");
+    expect(at_read_timed_out(1000, 1000, true), "a full timeout returns even while RX still has bytes");
+    expect(at_read_timed_out(1500, 200, true), "a busy UART cannot stretch a 200ms AT read");
+    expect(!at_read_timed_out(0, 1000, false), "a fresh read is not timed out");
+
+    const uint32_t budget = (uint32_t)AWAKE_BUDGET_MS;
+    expect(budget == 240000UL, "the awake budget is 240s");
+    expect(cap_wait_ms(30000, 0, budget) == 30000, "the install delay runs in full at boot");
+    expect(cap_wait_ms(30000, 220000, budget) == 20000, "the install delay stops at the awake budget");
+    expect(cap_wait_ms(20000, 230000, budget) == 10000, "an NTP wait is cut to the time still left");
+    expect(cap_wait_ms(gps_budget_sec(true, false, 0) * 1000UL, 200000, budget) == 40000, "a 90s GPS cold start is cut to the time still left");
+    expect(cap_wait_ms(90000, budget, budget) == 0, "no wait runs once the awake budget is spent");
+    expect(cap_wait_ms(30000, 370000, budget) == 0, "a 370s first boot cannot start another wait");
+
+    char err[24];
+    compose_net_err(err, sizeof(err), "pwr_off", "deadline");
+    expect(strcmp(err, "pwr_off+deadline") == 0, "a forced power-off keeps its token next to the failure");
+    compose_net_err(err, sizeof(err), "pwr_off", "");
+    expect(strcmp(err, "pwr_off") == 0, "a power-off with no later failure is still visible");
+    compose_net_err(err, sizeof(err), "", "deadline");
+    expect(strcmp(err, "deadline") == 0, "a failure with no bring-up branch stays the failure");
+    compose_net_err(err, sizeof(err), 0, 0);
+    expect(err[0] == '\0', "no branch and no failure leave the token empty");
 }
 
 static void test_rain_command_rising_edge() {
@@ -943,6 +976,7 @@ int main() {
     test_ota_confirm_counter();
     test_uplink_stale_and_deep_sleep_modem();
     test_sleep_floor_and_sim_reset();
+    test_confirmed_off_awake_cap_and_at_timeout();
     if (failures) {
         printf("%d failed\n", failures);
         return 1;
