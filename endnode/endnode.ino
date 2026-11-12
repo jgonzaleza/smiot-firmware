@@ -1,5 +1,5 @@
 /**
- * Smart IoT End Node Firmware 4.0.2
+ * Smart IoT End Node Firmware 4.0.3
  * Board: Lilygo A7608X-S3
  * Flow: Init -> HTTPS Config/Update -> Read Sensors  -> MQTT Upload -> Store RTC( SD optional) -> Deep Sleep
  * Date: Junio 2026
@@ -23,6 +23,9 @@
  * Change Log: 4.0.2 - Refuse placeholder certificates. Reload the modem
  *                    certificates when the compiled material changes, and
  *                    once per wake when TLS connect returns 32, 33, or 34.
+ * Change Log: 4.0.3 - Finish AT+CPOF before deep sleep, keep a minimum
+ *                    sleep after a long wake, and cold-reset when AT
+ *                    answers but the SIM does not.
  */
 
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
@@ -960,6 +963,8 @@ void check_for_firmware_update(bool force_check) {
     }
 }
 
+void power_off_modem_for_sleep();
+
 // Go to Deep Sleep Function
 void go_sleep(){
     #ifdef DEBUG
@@ -998,16 +1003,7 @@ void go_sleep(){
     #ifdef DEBUG
         Serial.println("Enter modem power off!");
     #endif
-    feed_watchdog();
-    modem.poweroff();
-    delay(5000);
-    feed_watchdog();
-    int k = 10;
-    while (modem.testAT(500) && (k > 0)) {
-        delay(500);
-        k--;
-        feed_watchdog();
-    }
+    power_off_modem_for_sleep();
     }
 
     pinMode(PIN_5V_EN, OUTPUT);
@@ -1047,9 +1043,7 @@ void go_sleep(){
     #endif
 
     uint32_t awake_sec = (millis() - g_wake_start_ms) / 1000UL;
-    uint32_t sleep_sec = active_sleep_sec;
-    if (awake_sec + 1 < sleep_sec) sleep_sec = sleep_sec - awake_sec;
-    else sleep_sec = 1;
+    uint32_t sleep_sec = sleep_sec_after_wake(awake_sec, active_sleep_sec);
     esp_sleep_enable_timer_wakeup((uint64_t)sleep_sec * uS_TO_S_FACTOR);
     delay(200);
 

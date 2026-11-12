@@ -452,6 +452,39 @@ static void test_uplink_stale_and_deep_sleep_modem() {
     expect(UPLINK_STALE_SEC == 7200, "the stale window is 2 hours");
 }
 
+static void test_sleep_floor_and_sim_reset() {
+    expect(sleep_sec_after_wake(100, 300) == 200, "a short wake keeps the remainder of the interval");
+    expect(sleep_sec_after_wake(0, 300) == 300, "a zero awake time sleeps the whole interval");
+    expect(sleep_sec_after_wake(298, 300) == 2, "a two second remainder is kept");
+    expect(sleep_sec_after_wake(299, 300) == MODEM_OFF_MIN_SLEEP_SEC, "the old 1 second clamp uses the floor");
+    expect(sleep_sec_after_wake(434, 300) == MODEM_OFF_MIN_SLEEP_SEC, "a wake past the interval sleeps the floor");
+    expect(sleep_sec_after_wake(434, 510) == 76, "510 minus 434 stays the remainder");
+    expect(MODEM_OFF_MIN_SLEEP_SEC >= 20, "the floor gives the modem time to finish powering off");
+    expect(MODEM_CPOF_BUDGET_MS >= 10000 && MODEM_CPOF_BUDGET_MS <= 20000, "CPOF retries until AT stops, with a bound");
+    expect(MODEM_SIM_READY_MS >= 8000 && MODEM_SIM_READY_MS <= 12000, "CPIN is given about 10 seconds");
+    expect(MODEM_PWRKEY_ON_MS >= 100 && MODEM_PWRKEY_ON_MS <= 500, "the cold-reset PWRKEY pulse is an on-pulse");
+
+    expect(cpin_text_is_ready("+CPIN: READY"), "CPIN READY is ready");
+    expect(cpin_text_is_ready("\r\n+CPIN: READY\r\n\r\nOK\r\n"), "CPIN READY before OK is ready");
+    expect(!cpin_text_is_ready("+CPIN: NOT READY"), "NOT READY is not ready");
+    expect(!cpin_text_is_ready("\r\n+CPIN: NOT READY\r\nOK\r\n"), "NOT READY before OK is not ready");
+    expect(!cpin_text_is_ready("+CPIN: SIM PIN"), "a locked SIM is not ready");
+    expect(!cpin_text_is_ready("+CPIN: NOT INSERTED"), "a missing SIM is not ready");
+    expect(!cpin_text_is_ready("+CPIN: SIM PIN\r\nSMS READY\r\nOK"), "SMS READY is not a SIM status");
+    expect(!cpin_text_is_ready("SMS READY"), "a boot URC without CPIN is not ready");
+    expect(!cpin_text_is_ready("ERROR"), "an error is not ready");
+    expect(!cpin_text_is_ready(0), "a missing response is not ready");
+
+    expect(sim_not_ready_needs_cold_reset(true, false), "AT up and SIM down takes the cold reset");
+    expect(!sim_not_ready_needs_cold_reset(true, true), "a ready SIM stays on the deep-sleep path");
+    expect(!sim_not_ready_needs_cold_reset(false, false), "a silent modem is powered on, not cold-reset here");
+    expect(!sim_not_ready_needs_cold_reset(false, true), "no AT means the silent path");
+
+    expect(!network_mode_retries_allowed(0), "a SIM that did not answer skips AUTO and GSM");
+    expect(network_mode_retries_allowed(1), "a ready SIM can try the next mode");
+    expect(network_mode_retries_allowed(-1), "a step that did not reach the SIM still retries");
+}
+
 static void test_rain_command_rising_edge() {
     const bool one = flag_is_on(true, false, false, true, 1);
     const bool json_true = flag_is_on(true, true, true, false, 0);
@@ -909,6 +942,7 @@ int main() {
     test_radio_skip_clears_on_restart();
     test_ota_confirm_counter();
     test_uplink_stale_and_deep_sleep_modem();
+    test_sleep_floor_and_sim_reset();
     if (failures) {
         printf("%d failed\n", failures);
         return 1;

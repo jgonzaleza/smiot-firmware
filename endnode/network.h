@@ -3,6 +3,7 @@
 #include <TinyGsmClient.h>
 
 void init_modem();
+void power_off_modem_for_sleep();
 bool init_network(NetworkMode mode_setup_value, bool show_status = false);
 void use_cell_client();
 #ifdef FEATURE_WIFI
