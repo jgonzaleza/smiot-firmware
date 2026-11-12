@@ -1,3 +1,4 @@
+#include "cert_guard.h"
 #include "csv_parse.h"
 #include "daily_log.h"
 #include "firmware_update_request.h"
@@ -333,6 +334,33 @@ static void test_daily_log_and_health() {
     expect(format_wake_log(&fields, line, sizeof(line)) > 0, "network step line fits");
     expect(strstr(line, ",1,0,-1,-1,-1,sim_timeout") != NULL, "wake line has modem steps and the reason");
     expect(strchr(line, '\n') == NULL, "network step line is one record");
+}
+
+static void test_cert_guard() {
+    const char* cert_a = "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n";
+    const char* key_a = "-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----\n";
+    const char* key_b = "-----BEGIN PRIVATE KEY-----\nCCC\n-----END PRIVATE KEY-----\n";
+    uint32_t same = cert_material_hash(cert_a, key_a);
+    expect(same == cert_material_hash(cert_a, key_a), "compiled cert hash is stable");
+    expect(same != cert_material_hash(cert_a, key_b), "a different key changes the hash");
+    expect(cert_tls_error(32) && cert_tls_error(33) && cert_tls_error(34), "tls session codes");
+    expect(!cert_tls_error(0) && !cert_tls_error(3) && !cert_tls_error(-1), "other connect codes stay retryable");
+    char token[16];
+    expect(format_mqtt_net_err(34, token, sizeof(token)) > 0, "mqtt error token fits");
+    expect(strcmp(token, "cmqtt_34") == 0, "last_net_err records the two-digit code");
+
+    WakeLogFields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.level = LOG_ERROR;
+    fields.unix_time = 1710000000UL;
+    fields.sim = "hologram";
+    fields.iccid = "89464278206109010629";
+    fields.plmn = "71204";
+    fields.net_err = token;
+    char line[192];
+    expect(format_wake_log(&fields, line, sizeof(line)) > 0, "tls wake line fits");
+    expect(strstr(line, "cmqtt_34") != NULL, "wake log records the mqtt result");
+    expect(wake_log_enabled(LOG_ERROR, true, false), "a tls error is written at error level");
 }
 
 static void test_radio_skip_accounting() {
@@ -876,6 +904,7 @@ int main() {
     test_missing_signature_rejects_ota();
     test_firmware_update_body_is_json();
     test_daily_log_and_health();
+    test_cert_guard();
     test_radio_skip_accounting();
     test_radio_skip_clears_on_restart();
     test_ota_confirm_counter();

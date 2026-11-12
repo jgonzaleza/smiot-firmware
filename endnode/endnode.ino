@@ -1,5 +1,5 @@
 /**
- * Smart IoT End Node Firmware 4.0.1
+ * Smart IoT End Node Firmware 4.0.2
  * Board: Lilygo A7608X-S3
  * Flow: Init -> HTTPS Config/Update -> Read Sensors  -> MQTT Upload -> Store RTC( SD optional) -> Deep Sleep
  * Date: Junio 2026
@@ -20,6 +20,9 @@
  *                    watchdog deadlines, crash-safe SD offset, error ring.
  * Change Log: 4.0.1 - Deep-sleep modem bring-up, radio-skip accounting,
  *                    confirm after two sleep uplinks, network step log.
+ * Change Log: 4.0.2 - Refuse placeholder certificates. Reload the modem
+ *                    certificates when the compiled material changes, and
+ *                    once per wake when TLS connect returns 32, 33, or 34.
  */
 
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
@@ -67,6 +70,7 @@
 #include "certs/AWSClientCertificate.h"
 #include "certs/AWSClientPrivateKey.h"
 #include "certs/AmazonRootCA.h"
+#include "cert_guard.h"
 #include "CommunicationManager.h"
 #include "CellularCommunicationClient.h"
 #ifdef FEATURE_WIFI
@@ -249,6 +253,89 @@ bool publish_sensor_payload(String payload) {
 
 // Initialize Peripherals
 
+static uint32_t compiled_cert_hash = 0;
+static bool compiled_hash_known = false;
+static bool compiled_hash_stored = false;
+static bool tls_reload_used = false;
+
+static void arm_cert_upload() {
+#ifdef ALLOW_PLACEHOLDER_CERTS
+    modem.mqtt_block_cert_upload(true);
+    return;
+#else
+    modem.mqtt_block_cert_upload(false);
+    if (!compiled_hash_known) {
+        compiled_cert_hash = cert_material_hash(AWSClientCertificate, AWSClientPrivateKey);
+        compiled_hash_known = true;
+    }
+    bool have = false;
+    uint32_t stored = 0;
+    if (preferences.begin("mqttcert", true)) {
+        have = preferences.isKey("hash");
+        stored = have ? preferences.getUInt("hash", 0) : 0;
+        preferences.end();
+    }
+    // Differing hash: delete and re-upload the three modem files once this wake.
+    modem.mqtt_force_cert_reload(!have || stored != compiled_cert_hash);
+#endif
+}
+
+static void remember_cert_hash() {
+#ifdef ALLOW_PLACEHOLDER_CERTS
+    return;
+#else
+    if (!compiled_hash_known || compiled_hash_stored) return;
+    if (!modem.mqtt_certs_written()) return;
+    if (!preferences.begin("mqttcert", false)) return;
+    preferences.putUInt("hash", compiled_cert_hash);
+    preferences.end();
+    compiled_hash_stored = true;
+#endif
+}
+
+static void record_tls_code(int code) {
+    if (!cert_tls_error(code)) return;
+    char token[16];
+    if (format_mqtt_net_err(code, token, sizeof(token)) < 0) return;
+    daily_log_net_reason(token);
+}
+
+static bool cellular_tls_failure() {
+    return comm.isCellular() && cert_tls_error(modem.mqtt_connect_code());
+}
+
+static bool mqtt_connect_once() {
+    bool ok = mqtt_connect();
+    if (comm.isCellular()) {
+        record_tls_code(modem.mqtt_connect_code());
+        remember_cert_hash();
+    }
+    return ok;
+}
+
+static void reset_mqtt_session() {
+    comm.mqtt_disconnect(client_index);
+    delay(1000);
+    comm.mqtt_end();
+    delay(1000);
+    comm.mqtt_begin(true);
+    comm.mqtt_set_certificate(AmazonRootCA, AWSClientCertificate, AWSClientPrivateKey);
+}
+
+static bool tls_recover_once() {
+    if (tls_reload_used) return false;
+    tls_reload_used = true;
+#ifdef ALLOW_PLACEHOLDER_CERTS
+    return false;
+#else
+    if (!comm.isCellular()) return false;
+    feed_watchdog();
+    modem.mqtt_force_cert_reload(true);
+    reset_mqtt_session();
+    return mqtt_connect_once();
+#endif
+}
+
 // Initialize MQTT Connection
 bool init_mqtt_connection() {
     bool mqtt_connect_result = false;
@@ -259,15 +346,22 @@ bool init_mqtt_connection() {
     comm.mqtt_begin(true);
 
     local_logger("MQTT Set Certificates . . .");
+    if (comm.isCellular()) arm_cert_upload();
     // Set Amazon Certificate
     comm.mqtt_set_certificate(AmazonRootCA, AWSClientCertificate, AWSClientPrivateKey);
-    
+
     local_logger("MQTT Connecting . . .");
     // Connecting to AWS IOT Core
-    mqtt_connect_result = mqtt_connect();
+    mqtt_connect_result = mqtt_connect_once();
+    // 32, 33, and 34 cannot succeed by repeating the same handshake.
+    // Stop the 11-try loop, replace the modem files once, and connect once more.
+    if (!mqtt_connect_result && cellular_tls_failure()) {
+        mqtt_connect_result = tls_recover_once();
+    }
 
     int k = 10;
-    while (!mqtt_connect_result && (k > 0)) {
+    while (!mqtt_connect_result && (k > 0) && !tls_reload_used && !cellular_tls_failure()
+        && !(comm.isCellular() && modem.mqtt_pem_refused())) {
         if (phase_deadline_hit(phase_start, MQTT_PHASE_BUDGET_MS)) {
             local_logger("init_mqtt_connection deadline");
             return false;
@@ -276,17 +370,17 @@ bool init_mqtt_connection() {
         // Check the connection every ten seconds
         #ifdef DEBUG
             Serial.println("Retrying MQTT Connect . . .");
-        #endif        
-        mqtt_connect_result = mqtt_connect();
-        if (!mqtt_connect_result) {            
-            if (k == 5){
+        #endif
+        mqtt_connect_result = mqtt_connect_once();
+        if (!mqtt_connect_result && cellular_tls_failure()) {
+            mqtt_connect_result = tls_recover_once();
+            break;
+        }
+        if (!mqtt_connect_result) {
+            if (comm.isCellular() && modem.mqtt_pem_refused()) break;
+            if (k == 5) {
                 //Try to reset the connection
-                comm.mqtt_disconnect(client_index);
-                delay(1000);
-                comm.mqtt_end();
-                delay(1000);
-                comm.mqtt_begin(true);
-                comm.mqtt_set_certificate(AmazonRootCA, AWSClientCertificate, AWSClientPrivateKey);
+                reset_mqtt_session();
             } else {
                 delay(2000);
             }
@@ -294,7 +388,7 @@ bool init_mqtt_connection() {
     }
     if (!mqtt_connect_result) {
         local_logger("MQTT No Connected . . .");
-    } 
+    }
     return mqtt_connect_result;
 }
 
