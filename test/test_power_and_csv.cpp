@@ -445,7 +445,7 @@ static void test_ota_confirm_counter() {
 static void test_uplink_stale_and_deep_sleep_modem() {
     expect(!modem_wake_from_deep_sleep(3), "software restart is a cold modem boot");
     expect(!modem_wake_from_deep_sleep(1), "power-on is a cold modem boot");
-    expect(modem_wake_from_deep_sleep(MODEM_RESET_REASON_DEEPSLEEP), "deep sleep probes AT before PWRKEY");
+    expect(modem_wake_from_deep_sleep(MODEM_RESET_REASON_DEEPSLEEP), "deep sleep is still a distinct reset reason");
     expect(!uplink_absent_for(0, 1000, UPLINK_STALE_SEC), "an unset clock does not force a reset");
     expect(!uplink_absent_for(8000, 0, UPLINK_STALE_SEC), "no successful uplink yet does not force a reset");
     expect(!uplink_absent_for(1000 + UPLINK_STALE_SEC - 1, 1000, UPLINK_STALE_SEC), "one second under 2 hours stays up");
@@ -454,14 +454,14 @@ static void test_uplink_stale_and_deep_sleep_modem() {
 }
 
 static void test_sleep_floor_and_sim_reset() {
-    expect(sleep_sec_after_wake(100, 300) == 200, "a short wake keeps the remainder of the interval");
-    expect(sleep_sec_after_wake(0, 300) == 300, "a zero awake time sleeps the whole interval");
-    expect(sleep_sec_after_wake(298, 300) == 2, "a two second remainder is kept");
-    expect(sleep_sec_after_wake(299, 300) == MODEM_OFF_MIN_SLEEP_SEC, "the old 1 second clamp uses the floor");
-    expect(sleep_sec_after_wake(434, 300) == MODEM_OFF_MIN_SLEEP_SEC, "a wake past the interval sleeps the floor");
-    expect(sleep_sec_after_wake(434, 510) == 76, "510 minus 434 stays the remainder");
-    expect(MODEM_OFF_MIN_SLEEP_SEC >= 20, "the floor gives the modem time to finish powering off");
-    expect(MODEM_CPOF_BUDGET_MS >= 10000 && MODEM_CPOF_BUDGET_MS <= 20000, "CPOF retries until AT stops, with a bound");
+    expect(sleep_sec_v300(300) == 300, "v300 sleeps the whole 300s interval");
+    expect(sleep_sec_v300(510) == 510, "v300 sleeps the whole 510s interval");
+    expect(sleep_sec_v300(300) == 300, "a wake past the interval still sleeps the whole interval");
+    expect(MODEM_CPOF_TRIES == 60, "CPOF is tried up to 60 times");
+    expect(MODEM_CPOF_GAP_MS == 500, "CPOF retries are 500ms apart");
+    expect(MODEM_CPOF_SETTLE_MS == 5000, "CPOF then waits 5 seconds");
+    expect(MODEM_CPOF_AT_TRIES == 50, "AT is polled until it stops, up to 50 times");
+    expect(!MODEM_PWRKEY_HOLD_IN_SLEEP, "PWRKEY is not held across sleep");
     expect(MODEM_SIM_READY_MS >= 8000 && MODEM_SIM_READY_MS <= 12000, "CPIN is given about 10 seconds");
     expect(MODEM_PWRKEY_ON_MS == 100, "the v3 on-pulse is 100ms, not the 200ms press");
     expect(MODEM_PWRKEY_ON_MS >= 100 && MODEM_PWRKEY_ON_MS <= 500, "the on-pulse stays in the power-on window");
@@ -489,8 +489,19 @@ static void test_sleep_floor_and_sim_reset() {
 }
 
 static void test_confirmed_off_awake_cap_and_at_timeout() {
-    expect(deep_sleep_bringup(true) == DEEP_SLEEP_FORCE_OFF, "AT up after deep sleep is powered off before the v3 reset");
-    expect(deep_sleep_bringup(false) == DEEP_SLEEP_ON_FROM_OFF, "a silent modem is already off and takes the v3 on-sequence");
+    int retry = 0;
+    int pulses = 0;
+    int first = -1;
+    for (int n = 0; n < MODEM_AT_PROBES; n++) {
+        if (v300_pwrkey_retry_due(retry)) {
+            if (first < 0) first = n;
+            pulses++;
+            retry = 0;
+        }
+    }
+    expect(MODEM_AT_PROBES == 50, "power-on waits for AT up to 50 times");
+    expect(first == 11, "the 1000ms press is the 12th failed probe");
+    expect(pulses == 4, "fifty failed probes include four 1000ms presses");
     expect(MODEM_PWRKEY_RETRY_MS != MODEM_PWRKEY_ON_MS, "the retry is not the short on-pulse");
 
     expect(!at_read_timed_out(999, 1000, true), "RX data does not end an AT read before the timeout");

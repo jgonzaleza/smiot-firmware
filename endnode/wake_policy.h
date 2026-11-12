@@ -5,42 +5,31 @@
 // Host-testable wake decisions. No Arduino types.
 //
 // ESP_RST_DEEPSLEEP is 8 (esp_reset_reason_t). A software restart is 3.
-// Deep-sleep modem bring-up keys off the reset reason only. The last
-// sleep wakeup cause can still read as the timer after esp_restart(),
-// and that must stay on the cold-boot path.
+// The v3.0.0 modem sequence does not branch on this. The reset reason
+// is still recorded so a software restart is not mistaken for deep sleep.
 
 static const int MODEM_RESET_REASON_DEEPSLEEP = 8;
 static const uint8_t RADIO_SKIP_CAP = 3;
 static const uint32_t UPLINK_STALE_SEC = 7200;
 static const uint8_t OTA_CONFIRM_UPLINKS = 2;
 static const uint8_t OTA_ROLLBACK_MISSES = 6;
-// A wake that already used the whole interval must not come back in 1s,
-// or the next boot lands inside an unfinished AT+CPOF.
-static const uint32_t MODEM_OFF_MIN_SLEEP_SEC = 20;
-// Bound the power-off wait. v3 retried until AT died, without a cap.
-static const uint32_t MODEM_CPOF_BUDGET_MS = 15000;
-// Kept for the CPIN parser tests. Deep-sleep bring-up no longer waits
-// this long before resetting: a short sleep can leave AT up with no SIM.
+// Kept for the CPIN parser tests. The v3.0.0 power sequence does not
+// wait this long before the reset pulse.
 static const uint32_t MODEM_SIM_READY_MS = 10000;
-// v3 power-on pulse. 100-500ms turns an A7608 on from the off state.
-// 200ms is not used: on a module that is already on it neither resets
-// it nor turns it off.
+// v3.0.0 on-pulse. Ton >= 100 <= 500. Turns an A7608 on from off.
 static const uint32_t MODEM_PWRKEY_ON_MS = 100;
-// v3 retry, and the press that turns an already-on module off.
-// About 1000ms toggles power on this board. The 2.5s spec off-press
-// is longer than the pulse that actually powers this A7608 down.
+// v3.0.0 retry press, used when AT stays down after the on-pulse.
 static const uint32_t MODEM_PWRKEY_RETRY_MS = 1000;
-
-// Deep sleep always runs the v3 on-sequence, and only after the module
-// is off. AT still answering means the short sleep brought it back.
-enum DeepSleepBringup {
-    DEEP_SLEEP_ON_FROM_OFF = 0,
-    DEEP_SLEEP_FORCE_OFF = 1
-};
-
-inline int deep_sleep_bringup(bool at_answered) {
-    return at_answered ? DEEP_SLEEP_FORCE_OFF : DEEP_SLEEP_ON_FROM_OFF;
-}
+// v3.0.0 go_sleep: up to 60 AT+CPOF tries, 500ms apart, then 5s, then
+// up to 50 testAT() waits (TinyGSM's default timeout) 1s apart.
+static const int MODEM_CPOF_TRIES = 60;
+static const uint32_t MODEM_CPOF_GAP_MS = 500;
+static const uint32_t MODEM_CPOF_SETTLE_MS = 5000;
+static const int MODEM_CPOF_AT_TRIES = 50;
+// v3.0.0 init_modem polls AT up to 50 times.
+static const int MODEM_AT_PROBES = 50;
+// v3.0.0 does not gpio_hold PWRKEY across sleep.
+static const bool MODEM_PWRKEY_HOLD_IN_SLEEP = false;
 
 // An AT read returns when its timeout elapses. Bytes still sitting in
 // the UART do not extend that timeout.
@@ -49,8 +38,7 @@ inline bool at_read_timed_out(uint32_t elapsed_ms, uint32_t timeout_ms, bool byt
     return elapsed_ms >= timeout_ms;
 }
 
-// First-boot waits (install delay, NTP, GPS) stop at the awake budget
-// instead of pushing the wake past the interval and into the 20s floor.
+// First-boot waits (install delay, NTP, GPS) stop at the awake budget.
 inline uint32_t cap_wait_ms(uint32_t want_ms, uint32_t elapsed_ms, uint32_t budget_ms) {
     if (elapsed_ms >= budget_ms) return 0;
     uint32_t left = budget_ms - elapsed_ms;
@@ -61,11 +49,16 @@ inline bool modem_wake_from_deep_sleep(int reset_reason) {
     return reset_reason == MODEM_RESET_REASON_DEEPSLEEP;
 }
 
-// Remainder of the interval, or the modem-off floor when the wake
-// already ran past it. The floor replaces the old 1 second clamp.
-inline uint32_t sleep_sec_after_wake(uint32_t awake_sec, uint32_t interval_sec) {
-    if (interval_sec > awake_sec + 1) return interval_sec - awake_sec;
-    return MODEM_OFF_MIN_SLEEP_SEC;
+// v3.0.0 slept the whole configured interval. Awake time is not
+// subtracted, and a long wake does not shorten the next sleep.
+inline uint32_t sleep_sec_v300(uint32_t interval_sec) {
+    return interval_sec;
+}
+
+// v3.0.0 init_modem: `if (retry++ > 10)` then a 1000ms PWRKEY press.
+// The press runs on the 12th failed AT probe, then the counter restarts.
+inline bool v300_pwrkey_retry_due(int& retry) {
+    return retry++ > 10;
 }
 
 inline const char* wake_text_find(const char* text, const char* needle) {
@@ -101,8 +94,7 @@ inline bool cpin_text_is_ready(const char* text) {
     return wake_text_find(mark, "READY") != 0 && wake_text_find(mark, "READY") < end;
 }
 
-// CPIN predicate only. Deep-sleep bring-up does not use it to skip the
-// reset: every deep-sleep wake powers on from a confirmed-off module.
+// CPIN predicate only. The v3.0.0 power-on sequence does not branch on it.
 inline bool sim_not_ready_needs_cold_reset(bool at_answered, bool cpin_ready) {
     return at_answered && !cpin_ready;
 }
