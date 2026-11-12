@@ -72,10 +72,21 @@ static void capture_registered_plmn() {
 
 static void modem_reset_deassert() {
 #ifdef MODEM_RESET_PIN
-    gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
+    // Program the idle level before releasing the hold. A hold release
+    // with the pin still unconfigured glitches the active-low reset.
     pinMode(MODEM_RESET_PIN, OUTPUT);
     digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
+    gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
+    digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
 #endif
+}
+
+void modem_release_sleep_pins() {
+    modem_reset_deassert();
+    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+    gpio_hold_dis((gpio_num_t)BOARD_PWRKEY_PIN);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
 }
 
 static void modem_hard_reset() {
@@ -109,38 +120,51 @@ static bool modem_wait_at(int attempts) {
     return false;
 }
 
-// Hard reset, then a PWRKEY press, then the same AT wait the cold boot uses.
-static bool modem_cold_boot(uint32_t pwrkey_high_ms) {
+// Hard reset, then the on-pulse, then AT. retry_ms is the v3 1000ms press
+// used only when AT stays down. It is not the 200ms pulse.
+static bool modem_cold_boot(uint32_t on_ms, uint32_t retry_ms) {
     modem_hard_reset();
-    modem_pwrkey_pulse(pwrkey_high_ms);
+    modem_pwrkey_pulse(on_ms);
     delay(1000);
     bool at_ok = false;
     int retry = 0;
     int k = 50;
     while (!(at_ok = modem.testAT(1000)) && k > 0) {
         feed_watchdog();
+        if (awake_budget_expired()) break;
         k--;
         if (retry++ > 10) {
-            modem_pwrkey_pulse(pwrkey_high_ms);
+            modem_pwrkey_pulse(retry_ms);
             retry = 0;
         }
     }
     return at_ok;
 }
 
-// Read +CPIN: ourselves. getSimStatus() treats "NOT READY" as READY
-// because the match for READY wins on endsWith.
-static bool modem_cpin_ready(uint32_t budget_ms) {
+// The module answered AT. Press the key until it stops, bounded.
+// 1000ms is the width that powers this board's already-on A7608 down.
+static bool modem_force_off() {
     uint32_t start = millis();
-    while (millis() - start < budget_ms) {
+    while (millis() - start < MODEM_CPOF_BUDGET_MS) {
         feed_watchdog();
-        String response;
-        modem.sendAT(GF("+CPIN?"));
-        modem.waitResponse(1000, response);
-        if (cpin_text_is_ready(response.c_str())) return true;
-        delay(250);
+        if (awake_budget_expired()) break;
+        modem_pwrkey_pulse(MODEM_PWRKEY_RETRY_MS);
+        delay(300);
+        if (!modem.testAT(500)) return true;
     }
-    return false;
+    return !modem.testAT(300);
+}
+
+// 1 ready, 2 locked, 0 not ready or no answer.
+// getSimStatus() treats "NOT READY" as READY because endsWith("READY") wins.
+static int modem_cpin_state() {
+    String response;
+    modem.sendAT(GF("+CPIN?"));
+    modem.waitResponse(1000, response);
+    const char* text = response.c_str();
+    if (cpin_text_is_ready(text)) return 1;
+    if (wake_text_find(text, "SIM PIN") || wake_text_find(text, "SIM PUK")) return 2;
+    return 0;
 }
 
 void power_off_modem_for_sleep() {
@@ -167,30 +191,24 @@ void init_modem() {
     pinMode(MODEM_DTR_PIN, OUTPUT);
     digitalWrite(MODEM_DTR_PIN, LOW);
 
-    // Deep-sleep wake: go_sleep() sends AT+CPOF and holds RESET deasserted.
-    // CPOF often leaves the UART up after the SIM is already down. Probe
-    // AT with RESET left inactive. If AT answers but CPIN is not READY,
-    // hard-reset and use a short PWRKEY press, then the cold-boot AT wait.
-    // Pulse PWRKEY once only when AT is silent. Power-on and software
-    // restart always take the cold boot, which is the path that works.
+    // Deep sleep: the module must be off before the v3 on-sequence.
+    // A short sleep can leave it answering AT (PWRKEY floated, or it
+    // restarted on VBAT). 200ms does not reset that state. Power it off
+    // with the 1000ms press, then RESET plus the 100ms on-pulse. If AT
+    // stays down, retry with 1000ms, which is v3's retry. Power-on and
+    // software restart keep the 1000ms on-pulse that brings a cold module up.
+    modem_release_sleep_pins();
     bool at_ok = false;
     if (modem_wake_from_deep_sleep((int)esp_reset_reason())) {
-        modem_reset_deassert();
-        pinMode(BOARD_PWRKEY_PIN, OUTPUT);
-        digitalWrite(BOARD_PWRKEY_PIN, LOW);
-        at_ok = modem_wait_at(5);
-        if (at_ok) {
-            bool sim_ready = modem_cpin_ready(MODEM_SIM_READY_MS);
-            if (sim_not_ready_needs_cold_reset(at_ok, sim_ready)) {
-                local_logger("SIM not ready after deep sleep. Cold-resetting the modem.");
-                at_ok = modem_cold_boot(MODEM_PWRKEY_ON_MS);
-            }
-        } else {
-            modem_pwrkey_pulse(1000);
-            at_ok = modem_wait_at(15);
+        bool at_up = modem_wait_at(3);
+        if (deep_sleep_bringup(at_up) == DEEP_SLEEP_FORCE_OFF) {
+            daily_log_net_branch("pwr_off");
+            local_logger("Modem is on after deep sleep. Powering it off before reset.");
+            modem_force_off();
         }
+        at_ok = modem_cold_boot(MODEM_PWRKEY_ON_MS, MODEM_PWRKEY_RETRY_MS);
     } else {
-        at_ok = modem_cold_boot(1000);
+        at_ok = modem_cold_boot(1000, MODEM_PWRKEY_RETRY_MS);
     }
     daily_log_net_at(at_ok ? 1 : 0);
     if (!at_ok) daily_log_net_reason("at_fail");
@@ -221,40 +239,36 @@ static bool net_deadline(unsigned long phase_start) {
 bool init_network(NetworkMode mode_setup_value, bool show_status) {
     unsigned long phase_start = millis();
     // Check if SIM card is online
-    SimStatus sim = SIM_ERROR;
+    int cpin = 0;
     bool result = false;
     int k = 30;
-    while ((sim != SIM_READY) && (k > 0)) {
+    while (cpin != 1 && k > 0) {
         if (net_deadline(phase_start)) {
             daily_log_net_sim(0);
             return false;
         }
         k--;
-        sim = modem.getSimStatus();
-        switch (sim) {
-            case SIM_READY:
-                #ifdef DEBUG
-                    Serial.println("SIM card online");
-                #endif
-                break;
-            case SIM_LOCKED:
-                Serial.println("The SIM card is locked. Please unlock the SIM card first.");
-                break;
-            default:
-                break;
-        }        
-        
+        cpin = modem_cpin_state();
+        if (cpin == 1) {
+            #ifdef DEBUG
+                Serial.println("SIM card online");
+            #endif
+            break;
+        }
+        if (cpin == 2) {
+            Serial.println("The SIM card is locked. Please unlock the SIM card first.");
+        }
         if (show_status) {
             //The blink gives us an one second delay
             blink_led(0, 255, 0);
         } else {
             delay(1000);
-        }        
+        }
     }
 
-    if (sim != SIM_READY) {
+    if (cpin != 1) {
         daily_log_net_sim(0);
-        daily_log_net_reason(sim == SIM_LOCKED ? "sim_locked" : "sim_timeout");
+        daily_log_net_reason(cpin == 2 ? "sim_locked" : "sim_timeout");
         if (show_status) {
             blink_led(255, 0, 0, 10000);
         }

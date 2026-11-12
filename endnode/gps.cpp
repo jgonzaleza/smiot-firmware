@@ -40,7 +40,12 @@ String get_gps_position(bool show_status) {
     bool accepted = false;
     int i = 10;
     bool enabled_gps = false;
+    if (awake_budget_expired()) {
+        local_logger("Awake budget used. Skipping GPS.");
+        return "{\"src\":\"Skipped\"}";
+    }
     while (!enabled_gps && (i > 0)) {
+        if (awake_budget_expired()) break;
         enabled_gps = modem.enableGPS(MODEM_GPS_ENABLE_GPIO);
         if (!enabled_gps) {
             local_logger(".");
@@ -70,9 +75,14 @@ String get_gps_position(bool show_status) {
         } else {
             local_logger("GPS warm start, budget", budget_sec, "s");
         }
-        const unsigned long budget_ms = (unsigned long)budget_sec * 1000UL;
+        const unsigned long full_ms = (unsigned long)budget_sec * 1000UL;
+        const unsigned long budget_ms = cap_awake_wait_ms((uint32_t)full_ms);
+        if (budget_ms < full_ms) {
+            local_logger("GPS budget capped by the awake limit", (uint32_t)(budget_ms / 1000UL), "s");
+        }
         const unsigned long started = millis();
         while ((millis() - started) < budget_ms) {
+            if (awake_budget_expired()) break;
             feed_watchdog();
             const unsigned long poll_at = millis();
             got_gps_data = modem.getGPS(&fixMode, &lat2, &lon2, &speed2, &alt2, &vsat2, &usat2, &accuracy2,
@@ -125,8 +135,12 @@ String get_gps_position(bool show_status) {
             blink_led(0,255,0);
         }
     } else {
-        if (enabled_gps && gps_fail_streak < 255) gps_fail_streak++;
-        daily_log_note_gps_fail();
+        if (awake_budget_expired()) {
+            local_logger("Awake budget used. GPS stopped.");
+        } else {
+            if (enabled_gps && gps_fail_streak < 255) gps_fail_streak++;
+            daily_log_note_gps_fail();
+        }
         //If we don't get GPS data in the correct range, we decide to use a fix value
         get_gps_data = false;
         if (!get_gps_data && gps_fix_ok(local_lat2, local_lon2)) {

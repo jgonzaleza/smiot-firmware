@@ -1,5 +1,5 @@
 /**
- * Smart IoT End Node Firmware 4.0.3
+ * Smart IoT End Node Firmware 4.0.4
  * Board: Lilygo A7608X-S3
  * Flow: Init -> HTTPS Config/Update -> Read Sensors  -> MQTT Upload -> Store RTC( SD optional) -> Deep Sleep
  * Date: Junio 2026
@@ -26,6 +26,10 @@
  * Change Log: 4.0.3 - Finish AT+CPOF before deep sleep, keep a minimum
  *                    sleep after a long wake, and cold-reset when AT
  *                    answers but the SIM does not.
+ * Change Log: 4.0.4 - Deep sleep powers the modem on from a confirmed-off
+ *                    state (1000ms PWRKEY retry, not 200ms). Hold PWRKEY
+ *                    low across sleep. AT reads honor their timeout.
+ *                    First boot stops at the awake budget.
  */
 
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
@@ -906,6 +910,10 @@ void firmware_update(const char *bucket_name, const char *file_name, const char*
 
 // Check for Firmware Update Function
 void check_for_firmware_update(bool force_check) {
+    if (awake_budget_expired()) {
+        local_logger("Awake budget used. Skipping firmware check.");
+        return;
+    }
 
     local_logger("Checking for an Update!");    
     #ifdef DEBUG
@@ -1036,6 +1044,11 @@ void go_sleep(){
         digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
         gpio_hold_en((gpio_num_t)MODEM_RESET_PIN);
     #endif
+    // GPIO 15 floats during deep sleep unless held. A float presses the
+    // key for the whole 20s floor and the module is already on at wake.
+    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+    gpio_hold_en((gpio_num_t)BOARD_PWRKEY_PIN);
     gpio_deep_sleep_hold_en();
 
     #ifdef DEBUG

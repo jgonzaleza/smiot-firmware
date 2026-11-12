@@ -57,9 +57,7 @@ void boot_start(WakeState& wake) {
     gpio_hold_dis((gpio_num_t)RS485_EN_PIN);
     gpio_hold_dis((gpio_num_t)RESET_RAIN_SENSOR_PIN);
     gpio_hold_dis((gpio_num_t)BOARD_SD_CS_PIN);
-#ifdef MODEM_RESET_PIN
-    gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
-#endif
+    modem_release_sleep_pins();
     gpio_deep_sleep_hold_dis();
     pinMode(PIN_5V_EN, OUTPUT);
     digitalWrite(PIN_5V_EN, HIGH);
@@ -77,8 +75,16 @@ void boot_start(WakeState& wake) {
 
     readingCnt++;
     if (first_run) {
-        delay(30000);
-        feed_watchdog();
+        uint32_t left = cap_awake_wait_ms(30000);
+        uint32_t waited = 0;
+        while (waited < left) {
+            uint32_t step = left - waited;
+            if (step > 1000) step = 1000;
+            delay(step);
+            feed_watchdog();
+            waited += step;
+            if (awake_budget_expired()) break;
+        }
     }
     queue_manager_init();
     init_relay();
