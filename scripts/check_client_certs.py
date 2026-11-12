@@ -94,6 +94,15 @@ def _gather_flag_text(env):
     return " ".join(chunks)
 
 
+def _as_flag_text(value):
+    """PlatformIO returns build_flags as a list of lines, not one string."""
+    if value is None or value is False:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_as_flag_text(item) for item in value)
+    return str(value)
+
+
 def effective_flag_text(raw_by_env, env_name):
     """Follow ${env:<name>.build_flags} so an extended env sees the base flags."""
     seen = set()
@@ -103,7 +112,7 @@ def effective_flag_text(raw_by_env, env_name):
         if not name or name in seen:
             return
         seen.add(name)
-        raw = raw_by_env.get(name, "") or ""
+        raw = _as_flag_text(raw_by_env.get(name, ""))
         chunks.append(raw)
         for match in re.findall(r"\$\{env:([^.}]+)\.build_flags\}", raw):
             walk(match)
@@ -198,6 +207,35 @@ def self_test():
         }, "endnode_wifi")
         if flags_allow_placeholder(plain):
             print("ERROR: wifi env bypassed without the flag", file=sys.stderr)
+            return 1
+        listed = effective_flag_text({
+            "endnode_cell": ["-DFIRMWARE_VERSION=402", "-DALLOW_PLACEHOLDER_CERTS"],
+            "endnode_wifi": ["${env:endnode_cell.build_flags}", "-DFEATURE_WIFI"],
+        }, "endnode_wifi")
+        if not flags_allow_placeholder(listed):
+            print("ERROR: list-valued build flags did not carry ALLOW_PLACEHOLDER_CERTS", file=sys.stderr)
+            return 1
+
+        class _Flags:
+            def sections(self):
+                return ["env:endnode_cell", "env:endnode_wifi"]
+
+            def get(self, section, option):
+                if option != "build_flags":
+                    return ""
+                if section == "env:endnode_cell":
+                    return ["-DFIRMWARE_VERSION=402", "-DALLOW_PLACEHOLDER_CERTS"]
+                return ["${env:endnode_cell.build_flags}", "-DFEATURE_WIFI"]
+
+        class _Env(dict):
+            def GetProjectConfig(self):
+                return _Flags()
+
+        if not allow_from_env(_Env(PIOENV="endnode_cell")):
+            print("ERROR: cell env missed a list-valued ALLOW_PLACEHOLDER_CERTS", file=sys.stderr)
+            return 1
+        if not allow_from_env(_Env(PIOENV="endnode_wifi")):
+            print("ERROR: wifi env missed a list-valued ALLOW_PLACEHOLDER_CERTS", file=sys.stderr)
             return 1
     finally:
         shutil.rmtree(root)
