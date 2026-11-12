@@ -13,6 +13,8 @@ jobs:
         with:
           python-version: "3.11"
       - name: Placeholder certificates
+        # CI only. Never run this step on a build machine. It overwrites
+        # endnode/certs/AWSClient*.h, and those real headers are not in git.
         run: |
           python3 - << 'PY'
           from pathlib import Path
@@ -21,9 +23,30 @@ jobs:
           (certs / "AWSClientCertificate.h").write_text('#include <pgmspace.h>\nstatic const char AWSClientCertificate[] PROGMEM = "placeholder-certificate\\n";\n')
           (certs / "AWSClientPrivateKey.h").write_text('#include <pgmspace.h>\nstatic const char AWSClientPrivateKey[] PROGMEM = "placeholder-private-key\\n";\n')
           PY
+      - name: Allow placeholder certificates in CI
+        run: |
+          python3 - << 'PY'
+          import re
+          from pathlib import Path
+          path = Path("platformio.ini")
+          text = path.read_text()
+          if "ALLOW_PLACEHOLDER_CERTS" in text:
+              raise SystemExit("ALLOW_PLACEHOLDER_CERTS must not be committed in platformio.ini")
+          new, count = re.subn(
+              r"(-DFIRMWARE_VERSION=\d+)",
+              r"\1\n\t-DALLOW_PLACEHOLDER_CERTS",
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("FIRMWARE_VERSION build flag not found")
+          path.write_text(new)
+          PY
       - name: Install PlatformIO
         run: pip install platformio
       - name: Build both images
         run: pio run -e endnode_cell -e endnode_wifi
       - name: Host tests
-        run: c++ -std=c++17 test/test_power_and_csv.cpp -Iendnode -o /tmp/firmware-tests && /tmp/firmware-tests
+        run: |
+          c++ -std=c++17 test/test_power_and_csv.cpp -Iendnode -o /tmp/firmware-tests && /tmp/firmware-tests
+          python3 scripts/check_client_certs.py --self-test

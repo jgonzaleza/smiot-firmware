@@ -25,10 +25,14 @@ c++ -std=c++17 test/test_power_and_csv.cpp -Iendnode -o /tmp/firmware-tests && /
 
 Copy `endnode/secrets.example.h` to `endnode/secrets.h`. That file is gitignored. Put the Wi-Fi SSID and password there for the Wi-Fi image, and the API keys when you have them. The example values are empty or `changeme`.
 
-These certificate headers are also gitignored and must exist on the build machine:
+The real client certificate headers live only on the build machine. They are gitignored:
 
 - `endnode/certs/AWSClientCertificate.h`
 - `endnode/certs/AWSClientPrivateKey.h`
+
+Restore that pair from the `d7b85258` certificate and key under `Certificados AWS/RS485_GSM_SD_CARD_NODE_V_2_x_x`. Do not generate or overwrite those headers.
+
+A build refuses the headers when they contain `placeholder`, or when the certificate lacks `BEGIN CERTIFICATE`, or when the key lacks `PRIVATE KEY`. The placeholder step in `.github/workflows/firmware.yml` is CI-only. Never run it on a build machine. CI compiles those placeholders with `-DALLOW_PLACEHOLDER_CERTS`. That image prints a boot warning and does not upload certificates to the modem.
 
 The Amazon root CA and the firmware signing **public** key are in the repository. Do not commit a private key.
 

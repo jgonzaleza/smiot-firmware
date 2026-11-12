@@ -8,8 +8,13 @@
 #pragma once
 
 #include "TinyGsmCommon.h"
+#include <string.h>
 
 #define TINY_GSM_MQTT_CLI_COUNT 2
+// Shorter than this is not a certificate or key. Longer than this is past
+// what AT+CCERTDOWN can store on the A7608.
+#define TINY_GSM_PEM_MIN_BYTES 64
+#define TINY_GSM_PEM_MAX_BYTES 8192
 
 template <class modemType, uint8_t muxCount>
 class TinyGsmMqttA76xx
@@ -30,6 +35,11 @@ protected:
     uint8_t will_qos = 0;
     bool _isConnected = false;
     uint32_t _lastCheckConnect = 0;
+    bool _block_cert_upload = false;
+    bool _force_cert_reload = false;
+    bool _certs_written = false;
+    bool _pem_refused = false;
+    int _mqtt_connect_code = -1;
 
 public:
     /*
@@ -94,6 +104,38 @@ public:
         this->client_key_pem = clientCertKey;
     }
 
+    // CI images set this. The modem keeps whatever files it already has.
+    void mqtt_block_cert_upload(bool block)
+    {
+        _block_cert_upload = block;
+        if (block) _force_cert_reload = false;
+    }
+
+    // One delete-and-upload of ca_cert.pem, cert.pem, and key_cert.pem.
+    void mqtt_force_cert_reload(bool force)
+    {
+        if (_block_cert_upload) {
+            _force_cert_reload = false;
+            return;
+        }
+        _force_cert_reload = force;
+    }
+
+    bool mqtt_certs_written() const
+    {
+        return _certs_written;
+    }
+
+    bool mqtt_pem_refused() const
+    {
+        return _pem_refused;
+    }
+
+    int mqtt_connect_code() const
+    {
+        return _mqtt_connect_code;
+    }
+
     void setWillMessage(const char *topic, const char *msg, uint8_t qos)
     {
         will_msg = msg;
@@ -111,71 +153,17 @@ public:
     {
         uint8_t authMethod = 0;
 
+        _mqtt_connect_code = -1;
+        _certs_written = false;
+        _pem_refused = false;
+
         if (clientIndex > muxCount) {
             return false;
         }
 
         if (this->cert_pem || this->client_cert_pem || this->client_key_pem) {
-            // Local edit: upload a certificate only when CCERTLIST does not already have it.
-            bool certs_present = false;
-            thisModem().sendAT("+CCERTLIST");
-            String cert_list;
-            if (thisModem().waitResponse(5000UL, cert_list) == 1) {
-                certs_present = cert_list.indexOf("ca_cert.pem") >= 0
-                    && cert_list.indexOf("\"cert.pem\"") >= 0
-                    && cert_list.indexOf("key_cert.pem") >= 0;
-            }
-            if (this->cert_pem && !certs_present) {
-                thisModem().sendAT("+CCERTDOWN=\"ca_cert.pem\",", strlen(this->cert_pem));
-                if (thisModem().waitResponse(10000UL, ">") == 1) {
-                    thisModem().stream.write(this->cert_pem);
-                }
-                if (thisModem().waitResponse() != 1) {
-                    ESP_LOGE("A76XX", "Write ca_cert pem failed!");
-                    return false;
-                }
-                thisModem().sendAT("+CSSLCFG=\"cacert\",0,\"ca_cert.pem\"");
-                thisModem().waitResponse();
-
-            }
-            if (this->client_cert_pem && !certs_present) {
-                thisModem().sendAT("+CCERTDOWN=\"cert.pem\",", strlen(this->client_cert_pem));
-                if (thisModem().waitResponse(10000UL, ">") == 1) {
-                    thisModem().stream.write(this->client_cert_pem);
-                }
-                if (thisModem().waitResponse() != 1) {
-                    ESP_LOGE("A76XX", "Write cert pem failed!");
-                    return false;
-                }
-                thisModem().sendAT("+CSSLCFG=\"clientcert\",0,\"cert.pem\"");
-                thisModem().waitResponse();
-
-            }
-            if (this->client_key_pem && !certs_present) {
-                thisModem().sendAT("+CCERTDOWN=\"key_cert.pem\",", strlen(this->client_key_pem));
-                if (thisModem().waitResponse(10000UL, ">") == 1) {
-                    thisModem().stream.write(this->client_key_pem);
-                }
-                if (thisModem().waitResponse() != 1) {
-                    ESP_LOGE("A76XX", "Write key_cert failed!");
-                    return false;
-                }
-                thisModem().sendAT("+CSSLCFG=\"clientkey\",0,\"key_cert.pem\"");
-                thisModem().waitResponse();
-            }
-            if (certs_present) {
-                if (this->cert_pem) {
-                    thisModem().sendAT("+CSSLCFG=\"cacert\",0,\"ca_cert.pem\"");
-                    thisModem().waitResponse();
-                }
-                if (this->client_cert_pem) {
-                    thisModem().sendAT("+CSSLCFG=\"clientcert\",0,\"cert.pem\"");
-                    thisModem().waitResponse();
-                }
-                if (this->client_key_pem) {
-                    thisModem().sendAT("+CSSLCFG=\"clientkey\",0,\"key_cert.pem\"");
-                    thisModem().waitResponse();
-                }
+            if (!install_mqtt_certificates()) {
+                return false;
             }
 
             // authMethod:
@@ -241,10 +229,16 @@ public:
         if (thisModem().waitResponse(30000UL, "+CMQTTCONNECT: ") != 1) {
             return false;
         }
-        thisModem().streamSkipUntil(',');
-        int res = thisModem().stream.read();
-        if (res != '0')return false;
-        return true;
+        // +CMQTTCONNECT: <client_index>,<result>. Result 34 is two digits;
+        // reading one character turned 0,34 into a generic failure.
+        int link = thisModem().streamGetIntBefore(',');
+        int res = thisModem().streamGetIntBefore('\n');
+        if (link == -9999 || res == -9999) {
+            _mqtt_connect_code = -1;
+            return false;
+        }
+        _mqtt_connect_code = res;
+        return res == 0;
 
     }
 
@@ -499,6 +493,104 @@ public:
 
 
 protected:
+    static bool pem_is_plausible(const char *pem)
+    {
+        if (!pem) return false;
+        while (*pem == ' ' || *pem == '\t' || *pem == '\r' || *pem == '\n') pem++;
+        if (strncmp(pem, "-----BEGIN", 10) != 0) return false;
+        size_t length = strlen(pem);
+        return length >= TINY_GSM_PEM_MIN_BYTES && length <= TINY_GSM_PEM_MAX_BYTES;
+    }
+
+    void delete_modem_cert(const char *filename)
+    {
+        thisModem().sendAT("+CCERTDELE=\"", filename, "\"");
+        thisModem().waitResponse(3000UL);
+    }
+
+    void select_modem_cert(const char *field, const char *filename)
+    {
+        thisModem().sendAT("+CSSLCFG=\"", field, "\",0,\"", filename, "\"");
+        thisModem().waitResponse();
+    }
+
+    bool upload_modem_cert(const char *filename, const char *pem, const char *field)
+    {
+        if (!pem_is_plausible(pem)) {
+            _pem_refused = true;
+            ESP_LOGE("A76XX", "Refusing certificate upload");
+            return false;
+        }
+        thisModem().sendAT("+CCERTDOWN=\"", filename, "\",", strlen(pem));
+        if (thisModem().waitResponse(10000UL, ">") == 1) {
+            thisModem().stream.write(pem);
+        }
+        if (thisModem().waitResponse() != 1) {
+            ESP_LOGE("A76XX", "Write certificate pem failed!");
+            return false;
+        }
+        select_modem_cert(field, filename);
+        return true;
+    }
+
+    bool install_mqtt_certificates()
+    {
+        if (_block_cert_upload) {
+            _force_cert_reload = false;
+            if (this->cert_pem) select_modem_cert("cacert", "ca_cert.pem");
+            if (this->client_cert_pem) select_modem_cert("clientcert", "cert.pem");
+            if (this->client_key_pem) select_modem_cert("clientkey", "key_cert.pem");
+            return true;
+        }
+
+        bool present = false;
+        if (!_force_cert_reload) {
+            // Local edit: upload only when CCERTLIST does not already have the files.
+            thisModem().sendAT("+CCERTLIST");
+            String cert_list;
+            if (thisModem().waitResponse(5000UL, cert_list) == 1) {
+                present = cert_list.indexOf("ca_cert.pem") >= 0
+                    && cert_list.indexOf("\"cert.pem\"") >= 0
+                    && cert_list.indexOf("key_cert.pem") >= 0;
+            }
+        }
+        bool upload = _force_cert_reload || !present;
+        if (!upload) {
+            if (this->cert_pem) select_modem_cert("cacert", "ca_cert.pem");
+            if (this->client_cert_pem) select_modem_cert("clientcert", "cert.pem");
+            if (this->client_key_pem) select_modem_cert("clientkey", "key_cert.pem");
+            return true;
+        }
+
+        // Validate every PEM before deleting or writing. A bad image must not
+        // wipe the files already on the modem.
+        if ((this->cert_pem && !pem_is_plausible(this->cert_pem))
+            || (this->client_cert_pem && !pem_is_plausible(this->client_cert_pem))
+            || (this->client_key_pem && !pem_is_plausible(this->client_key_pem))) {
+            _pem_refused = true;
+            _force_cert_reload = false;
+            ESP_LOGE("A76XX", "Refusing certificate upload");
+            return false;
+        }
+        if (_force_cert_reload) {
+            delete_modem_cert("ca_cert.pem");
+            delete_modem_cert("cert.pem");
+            delete_modem_cert("key_cert.pem");
+            _force_cert_reload = false;
+        }
+        if (this->cert_pem && !upload_modem_cert("ca_cert.pem", this->cert_pem, "cacert")) {
+            return false;
+        }
+        if (this->client_cert_pem && !upload_modem_cert("cert.pem", this->client_cert_pem, "clientcert")) {
+            return false;
+        }
+        if (this->client_key_pem && !upload_modem_cert("key_cert.pem", this->client_key_pem, "clientkey")) {
+            return false;
+        }
+        _certs_written = true;
+        return true;
+    }
+
     bool mqttWillTopic(uint8_t clientIndex, const char *topic)
     {
         if (clientIndex > muxCount) {

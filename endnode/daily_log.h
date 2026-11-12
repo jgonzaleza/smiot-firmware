@@ -37,7 +37,7 @@ struct DailyHealth {
 };
 
 // One wake's modem steps. -1 means that step did not run.
-// reason is a short token with no comma: at_fail, sim_timeout, skip, ...
+// reason is a short token with no comma: at_fail, sim_timeout, skip, cmqtt_34, ...
 struct NetStepTrace {
     int at;
     int sim;

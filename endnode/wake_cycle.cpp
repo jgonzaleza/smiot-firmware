@@ -10,6 +10,7 @@
 #include "queue_manager.h"
 #include "daily_log.h"
 #include "wake_policy.h"
+#include "cert_guard.h"
 #include <ArduinoJson.h>
 #include <esp_system.h>
 
@@ -46,6 +47,10 @@ void boot_start(WakeState& wake) {
         load_device_params();
     }
     Serial.begin(115200);
+    cert_guard_boot_warning();
+#ifdef ALLOW_PLACEHOLDER_CERTS
+    modem.mqtt_block_cert_upload(true);
+#endif
     daily_log_boot((int)esp_reset_reason());
     Serial.println(ESP.getEfuseMac());
     gpio_hold_dis((gpio_num_t)PIN_5V_EN);
