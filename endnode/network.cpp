@@ -89,13 +89,15 @@ static void modem_hard_reset() {
 }
 
 // Board PWRKEY is active-high into a transistor, so a high pulse presses
-// the modem key. On the A7608 that key toggles power.
-static void modem_pwrkey_pulse() {
+// the modem key. On the A7608 that key toggles power. high_ms is the
+// press width: 100-500ms turns a module on, and about 1000ms can turn
+// one that is already on back off.
+static void modem_pwrkey_pulse(uint32_t high_ms) {
     pinMode(BOARD_PWRKEY_PIN, OUTPUT);
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
     delay(100);
     digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-    delay(1000);
+    delay(high_ms);
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
 }
 
@@ -105,6 +107,50 @@ static bool modem_wait_at(int attempts) {
         if (modem.testAT(1000)) return true;
     }
     return false;
+}
+
+// Hard reset, then a PWRKEY press, then the same AT wait the cold boot uses.
+static bool modem_cold_boot(uint32_t pwrkey_high_ms) {
+    modem_hard_reset();
+    modem_pwrkey_pulse(pwrkey_high_ms);
+    delay(1000);
+    bool at_ok = false;
+    int retry = 0;
+    int k = 50;
+    while (!(at_ok = modem.testAT(1000)) && k > 0) {
+        feed_watchdog();
+        k--;
+        if (retry++ > 10) {
+            modem_pwrkey_pulse(pwrkey_high_ms);
+            retry = 0;
+        }
+    }
+    return at_ok;
+}
+
+// Read +CPIN: ourselves. getSimStatus() treats "NOT READY" as READY
+// because the match for READY wins on endsWith.
+static bool modem_cpin_ready(uint32_t budget_ms) {
+    uint32_t start = millis();
+    while (millis() - start < budget_ms) {
+        feed_watchdog();
+        String response;
+        modem.sendAT(GF("+CPIN?"));
+        modem.waitResponse(1000, response);
+        if (cpin_text_is_ready(response.c_str())) return true;
+        delay(250);
+    }
+    return false;
+}
+
+void power_off_modem_for_sleep() {
+    uint32_t start = millis();
+    while (millis() - start < MODEM_CPOF_BUDGET_MS) {
+        feed_watchdog();
+        modem.poweroff();
+        delay(500);
+        if (!modem.testAT(500)) return;
+    }
 }
 
 void init_modem() {
@@ -122,36 +168,29 @@ void init_modem() {
     digitalWrite(MODEM_DTR_PIN, LOW);
 
     // Deep-sleep wake: go_sleep() sends AT+CPOF and holds RESET deasserted.
-    // CPOF often does not finish, so the modem is still on. A RESET pulse
-    // plus a PWRKEY pulse toggles that modem off, and the wake never
-    // reaches getSimCCID. Probe AT with RESET left inactive. Pulse PWRKEY
-    // once only when AT is silent, then wait for boot with no second pulse.
-    // Cold boot and software restart keep the hard reset and power-on pulse.
-    // That is the path that works on the post-OTA first_run.
+    // CPOF often leaves the UART up after the SIM is already down. Probe
+    // AT with RESET left inactive. If AT answers but CPIN is not READY,
+    // hard-reset and use a short PWRKEY press, then the cold-boot AT wait.
+    // Pulse PWRKEY once only when AT is silent. Power-on and software
+    // restart always take the cold boot, which is the path that works.
     bool at_ok = false;
     if (modem_wake_from_deep_sleep((int)esp_reset_reason())) {
         modem_reset_deassert();
         pinMode(BOARD_PWRKEY_PIN, OUTPUT);
         digitalWrite(BOARD_PWRKEY_PIN, LOW);
         at_ok = modem_wait_at(5);
-        if (!at_ok) {
-            modem_pwrkey_pulse();
+        if (at_ok) {
+            bool sim_ready = modem_cpin_ready(MODEM_SIM_READY_MS);
+            if (sim_not_ready_needs_cold_reset(at_ok, sim_ready)) {
+                local_logger("SIM not ready after deep sleep. Cold-resetting the modem.");
+                at_ok = modem_cold_boot(MODEM_PWRKEY_ON_MS);
+            }
+        } else {
+            modem_pwrkey_pulse(1000);
             at_ok = modem_wait_at(15);
         }
     } else {
-        modem_hard_reset();
-        modem_pwrkey_pulse();
-        delay(1000);
-        int retry = 0;
-        int k = 50;
-        while (!(at_ok = modem.testAT(1000)) && k > 0) {
-            feed_watchdog();
-            k--;
-            if (retry++ > 10) {
-                modem_pwrkey_pulse();
-                retry = 0;
-            }
-        }
+        at_ok = modem_cold_boot(1000);
     }
     daily_log_net_at(at_ok ? 1 : 0);
     if (!at_ok) daily_log_net_reason("at_fail");
@@ -561,15 +600,17 @@ bool connect_uplink(bool show_status) {
         local_logger("Initializing Network Try 1 LTE");
         ok = init_network(MODEM_NETWORK_LTE, show_status);
         feed_watchdog();
-        if (!ok) {
+        if (!ok && network_mode_retries_allowed(daily_log_net_trace()->sim)) {
             local_logger("Initializing Network Try 2 LTE");
             ok = init_network(MODEM_NETWORK_AUTO, show_status);
             feed_watchdog();
-            if (!ok) {
+            if (!ok && network_mode_retries_allowed(daily_log_net_trace()->sim)) {
                 local_logger("Initializing Network Try 1 GSM");
                 ok = init_network(MODEM_NETWORK_GSM, show_status);
                 feed_watchdog();
             }
+        } else if (!ok) {
+            local_logger("SIM did not answer. Skipping further registration attempts.");
         }
     }
     if (ok) {
