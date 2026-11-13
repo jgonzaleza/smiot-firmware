@@ -1071,6 +1071,7 @@ void go_sleep(){
     #endif
 
     uint32_t awake_sec = (millis() - g_wake_start_ms) / 1000UL;
+    // Off time is the configured interval, not interval minus time awake.
     uint32_t sleep_sec = sleep_sec_at_least(awake_sec, active_sleep_sec);
     esp_sleep_enable_timer_wakeup((uint64_t)sleep_sec * uS_TO_S_FACTOR);
     delay(200);

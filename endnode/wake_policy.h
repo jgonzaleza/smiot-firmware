@@ -61,11 +61,12 @@ inline uint32_t sleep_sec_v300(uint32_t interval_sec) {
 // After a wake, sleep at least this long. This is not the old 20s floor.
 static const uint32_t MIN_SLEEP_AFTER_WAKE_SEC = 120;
 
-// Sleep the rest of the interval. If that remainder is under 120s,
-// or the wake already used the whole interval, sleep 120s.
+// Sleep the configured interval. Time already awake is not subtracted,
+// so the off time between wakes stays constant. An interval under 120s
+// sleeps 120s. This is not the old 20s floor.
 inline uint32_t sleep_sec_at_least(uint32_t awake_sec, uint32_t interval_sec) {
-    uint32_t remain = interval_sec > awake_sec ? interval_sec - awake_sec : 0;
-    return remain >= MIN_SLEEP_AFTER_WAKE_SEC ? remain : MIN_SLEEP_AFTER_WAKE_SEC;
+    (void)awake_sec;
+    return interval_sec >= MIN_SLEEP_AFTER_WAKE_SEC ? interval_sec : MIN_SLEEP_AFTER_WAKE_SEC;
 }
 
 // v3.0.0 init_modem: `if (retry++ > 10)` then a 1000ms PWRKEY press.
