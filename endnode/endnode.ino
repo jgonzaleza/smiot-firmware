@@ -1,5 +1,5 @@
 /**
- * Smart IoT End Node Firmware 4.0.5
+ * Smart IoT End Node Firmware 4.0.6
  * Board: Lilygo A7608X-S3
  * Flow: Init -> HTTPS Config/Update -> Read Sensors  -> MQTT Upload -> Store RTC( SD optional) -> Deep Sleep
  * Date: Junio 2026
@@ -34,6 +34,10 @@
  *                    v3.0.0 sequence again. PWRKEY is not held across
  *                    sleep. First-boot awake caps, the AT-read timeout,
  *                    and the NOT READY check stay.
+ * Change Log: 4.0.6 - Sensor rail and RS485 stay off until the modem
+ *                    and uplink finish. turn_sensors_off drops the rail.
+ *                    CPIN continues on NOT READY, as in v3.0.0.
+ *                    Sleep at least 120s. A shorter remainder becomes 120s.
  */
 
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
@@ -1056,7 +1060,8 @@ void go_sleep(){
         Serial.println("Weather Station is going to  deep sleep!");
     #endif
 
-    uint32_t sleep_sec = sleep_sec_v300(active_sleep_sec);
+    uint32_t awake_sec = (millis() - g_wake_start_ms) / 1000UL;
+    uint32_t sleep_sec = sleep_sec_at_least(awake_sec, active_sleep_sec);
     esp_sleep_enable_timer_wakeup((uint64_t)sleep_sec * uS_TO_S_FACTOR);
     delay(200);
 
@@ -1217,11 +1222,13 @@ void setup() {
     WakeState wake;
     boot_start(wake);
     network_provision(wake);
+    // v3.0.0: modem and network before the sensor rail. sensors_sample
+    // turns the rail and RS485 on. turn_sensors_off drops them again.
+    network_transmit_if_needed(wake);
     wake.sensors = sensors_sample(&wake.configured);
     apply_pack_power(wake.sensors);
     turn_sensors_off();
     wake.gps = gps_sample(modem_was_powered, first_run);
-    network_transmit_if_needed(wake);
     deliver_sample(wake);
     sleep_now();
 }

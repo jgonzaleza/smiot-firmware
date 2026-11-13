@@ -168,9 +168,15 @@ inline void turn_sensors_on(){
     digitalWrite(RELAY_PIN, HIGH);
 }
 
-// Turn the sensors off by setting the relay pin low
+// Turn the sensors off. The relay alone leaves the 5V rail powered.
+// v3.0.0 drives that rail low again before sleep; drop it here so the
+// station is not still powering the sensors while it waits.
 inline void turn_sensors_off(){
     digitalWrite(RELAY_PIN, LOW);
+    pinMode(RS485_EN_PIN, OUTPUT);
+    digitalWrite(RS485_EN_PIN, LOW);
+    pinMode(PIN_5V_EN, OUTPUT);
+    digitalWrite(PIN_5V_EN, LOW);
 }
 
 

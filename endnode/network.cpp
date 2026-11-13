@@ -70,14 +70,15 @@ static void capture_registered_plmn() {
     local_logger("Registered PLMN: ", registered_plmn);
 }
 
-// 1 ready, 2 locked, 0 not ready or no answer.
-// getSimStatus() treats "NOT READY" as READY because endsWith("READY") wins.
+// 1 continue, 2 locked, 0 no answer or not inserted.
+// v3.0.0 getSimStatus continues when the +CPIN: line ends with READY,
+// which includes NOT READY. It does not wait out the awake budget.
 static int modem_cpin_state() {
     String response;
     modem.sendAT(GF("+CPIN?"));
     modem.waitResponse(1000, response);
     const char* text = response.c_str();
-    if (cpin_text_is_ready(text)) return 1;
+    if (cpin_v3_continues(text)) return 1;
     if (wake_text_find(text, "SIM PIN") || wake_text_find(text, "SIM PUK")) return 2;
     return 0;
 }
@@ -110,6 +111,11 @@ void init_modem() {
     gpio_hold_dis((gpio_num_t)RESET_RAIN_SENSOR_PIN);
     gpio_hold_dis((gpio_num_t)BOARD_SD_CS_PIN);
     gpio_deep_sleep_hold_dis();
+    // v3.0.0 powers the modem before init_peripherals turns the rail on.
+    pinMode(PIN_5V_EN, OUTPUT);
+    digitalWrite(PIN_5V_EN, SENSOR_RAIL_DURING_MODEM ? HIGH : LOW);
+    pinMode(RS485_EN_PIN, OUTPUT);
+    digitalWrite(RS485_EN_PIN, SENSOR_RAIL_DURING_MODEM ? HIGH : LOW);
 
 #ifdef BOARD_POWERON_PIN
     pinMode(BOARD_POWERON_PIN, OUTPUT);
