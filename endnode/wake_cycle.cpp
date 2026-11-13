@@ -2,7 +2,6 @@
 #include "firmware_context.h"
 #include "network.h"
 #include "sensors.h"
-#include "gps_module.h"
 #include "logger.h"
 #include "app_utils.h"
 #include "time_manager.h"
@@ -58,8 +57,14 @@ void boot_start(WakeState& wake) {
     gpio_hold_dis((gpio_num_t)RESET_RAIN_SENSOR_PIN);
     gpio_hold_dis((gpio_num_t)BOARD_SD_CS_PIN);
     gpio_deep_sleep_hold_dis();
+    // Rail and RS485 stay off until init_modem and connect_uplink finish.
+    // The radio decision uses the previous wake's power mode so this wake
+    // does not power the sensors just to learn the pack voltage.
+    active_power_mode = (uint8_t)saved_power_mode;
     pinMode(PIN_5V_EN, OUTPUT);
-    digitalWrite(PIN_5V_EN, HIGH);
+    digitalWrite(PIN_5V_EN, SENSOR_RAIL_DURING_MODEM ? HIGH : LOW);
+    pinMode(RS485_EN_PIN, OUTPUT);
+    digitalWrite(RS485_EN_PIN, SENSOR_RAIL_DURING_MODEM ? HIGH : LOW);
     recover_if_uplink_stale();
 
     if (rtc_reset_was_panic()) {
@@ -122,7 +127,6 @@ bool network_transmit_if_needed(WakeState& wake) {
         if (wake.uplink) {
             sync_clock();
             check_for_firmware_update(false);
-            wake.gps = gps_sample(true, false);
         }
     }
     wake.radio_skipped = want_radio && !attempted;

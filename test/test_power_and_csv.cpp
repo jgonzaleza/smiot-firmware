@@ -469,8 +469,19 @@ static void test_sleep_floor_and_sim_reset() {
 
     expect(cpin_text_is_ready("+CPIN: READY"), "CPIN READY is ready");
     expect(cpin_text_is_ready("\r\n+CPIN: READY\r\n\r\nOK\r\n"), "CPIN READY before OK is ready");
-    expect(!cpin_text_is_ready("+CPIN: NOT READY"), "NOT READY is not ready");
-    expect(!cpin_text_is_ready("\r\n+CPIN: NOT READY\r\nOK\r\n"), "NOT READY before OK is not ready");
+    expect(!cpin_text_is_ready("+CPIN: NOT READY"), "the exact-READY parser rejects NOT READY");
+    expect(!cpin_text_is_ready("\r\n+CPIN: NOT READY\r\nOK\r\n"), "the exact-READY parser rejects NOT READY before OK");
+    expect(cpin_v3_continues("+CPIN: READY"), "v3 continues on CPIN READY");
+    expect(cpin_v3_continues("+CPIN: NOT READY"), "v3 continues on NOT READY because it ends with READY");
+    expect(cpin_v3_continues("\r\n+CPIN: NOT READY\r\nOK\r\n"), "v3 continues on NOT READY before OK");
+    expect(!cpin_v3_continues("+CPIN: SIM PIN"), "v3 does not continue on a locked SIM");
+    expect(!cpin_v3_continues("+CPIN: SIM PUK"), "v3 does not continue on a PUK lock");
+    expect(!cpin_v3_continues("+CPIN: NOT INSERTED"), "v3 does not continue when the SIM is missing");
+    expect(!cpin_v3_continues("+CPIN: SIM PIN\r\nSMS READY\r\nOK"), "SMS READY on the next line is not the CPIN token");
+    expect(!cpin_v3_continues("SMS READY"), "a boot URC without CPIN does not continue");
+    expect(!cpin_v3_continues("ERROR"), "an error does not continue");
+    expect(!cpin_v3_continues(0), "a missing response does not continue");
+    expect(!SENSOR_RAIL_DURING_MODEM, "the 5V rail and RS485 stay off through the modem and uplink");
     expect(!cpin_text_is_ready("+CPIN: SIM PIN"), "a locked SIM is not ready");
     expect(!cpin_text_is_ready("+CPIN: NOT INSERTED"), "a missing SIM is not ready");
     expect(!cpin_text_is_ready("+CPIN: SIM PIN\r\nSMS READY\r\nOK"), "SMS READY is not a SIM status");

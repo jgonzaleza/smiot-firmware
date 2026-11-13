@@ -30,6 +30,9 @@ static const int MODEM_CPOF_AT_TRIES = 50;
 static const int MODEM_AT_PROBES = 50;
 // v3.0.0 does not gpio_hold PWRKEY across sleep.
 static const bool MODEM_PWRKEY_HOLD_IN_SLEEP = false;
+// v3.0.0 keeps the sensor 5V rail and RS485 off through init_modem and
+// the network step. The rail comes on only for the sensor read.
+static const bool SENSOR_RAIL_DURING_MODEM = false;
 
 // An AT read returns when its timeout elapses. Bytes still sitting in
 // the UART do not extend that timeout.
@@ -92,6 +95,28 @@ inline bool cpin_text_is_ready(const char* text) {
         if (i == nlen) return false;
     }
     return wake_text_find(mark, "READY") != 0 && wake_text_find(mark, "READY") < end;
+}
+
+// v3.0.0 getSimStatus matches "READY" before "NOT READY". endsWith("READY")
+// is true for "NOT READY", so the network step continues. The token is the
+// rest of the +CPIN: line. SIM PIN, SIM PUK, and NOT INSERTED do not match.
+// "SMS READY" on a later line is not this token.
+inline bool cpin_v3_continues(const char* text) {
+    const char* mark = wake_text_find(text, "+CPIN:");
+    if (!mark) return false;
+    mark += 6;
+    while (*mark == ' ' || *mark == '\t') ++mark;
+    const char* end = mark;
+    while (*end && *end != '\r' && *end != '\n') ++end;
+    const char ready[] = "READY";
+    unsigned n = 0;
+    while (ready[n]) ++n;
+    if ((unsigned)(end - mark) < n) return false;
+    const char* tail = end - n;
+    for (unsigned i = 0; i < n; ++i) {
+        if (tail[i] != ready[i]) return false;
+    }
+    return true;
 }
 
 // CPIN predicate only. The v3.0.0 power-on sequence does not branch on it.
