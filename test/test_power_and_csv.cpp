@@ -470,6 +470,47 @@ static void test_yard_timing_units() {
            "one stabilize plus one gap is 7s, not minutes");
 }
 
+static void test_timing_defaults_then_backend() {
+    DeviceTiming fresh = firmware_timing_defaults();
+    expect(fresh.sleep_sec == 300, "default sleep is 300 seconds");
+    expect(fresh.stabilize_ms == 5000, "default stabilize is 5000 ms");
+    expect(fresh.between_ms == 2000, "default gap is 2000 ms");
+    expect(fresh.reading_count == 1, "default reading count is 1");
+    expect(fresh.reading_rate == 1, "default reading rate is 1");
+    expect(DEFAULT_SLEEP_SEC == 300, "sleep default constant is 300");
+    expect(DEFAULT_TIME_TO_READ_SENSOR == 5000, "stabilize default constant is 5000");
+    expect(DEFAULT_TIME_BETWEEN_READINGS == 2000, "gap default constant is 2000");
+    expect(DEFAULT_READING_COUNT == 1, "count default constant is 1");
+    expect(DEFAULT_READING_RATE == 1, "rate default constant is 1");
+
+    BackendTiming none = {};
+    DeviceTiming untouched = apply_backend_timing(fresh, none);
+    expect(untouched.sleep_sec == 300, "an empty payload keeps sleep at 300s");
+    expect(untouched.stabilize_ms == 5000, "an empty payload keeps stabilize at 5000 ms");
+    expect(untouched.between_ms == 2000, "an empty payload keeps the gap at 2000 ms");
+    expect(untouched.reading_count == 1, "an empty payload keeps count at 1");
+    expect(untouched.reading_rate == 1, "an empty payload keeps rate at 1");
+
+    BackendTiming override = {};
+    override.has_sleep = true;
+    override.sleep_sec = 600;
+    override.has_stabilize = true;
+    override.stabilize_ms = 8000;
+    override.has_between = true;
+    override.between_ms = 4000;
+    override.has_count = true;
+    override.reading_count = 2;
+    override.has_rate = true;
+    override.reading_rate = 2;
+    DeviceTiming replaced = apply_backend_timing(fresh, override);
+    expect(replaced.sleep_sec == 600, "backend sleep replaces 300s");
+    expect(replaced.stabilize_ms == 8000, "backend stabilize replaces 5000 ms");
+    expect(replaced.between_ms == 4000, "backend gap replaces 2000 ms and stays milliseconds");
+    expect(replaced.between_ms != 120, "a 4000 ms gap is not cut to 120");
+    expect(replaced.reading_count == 2, "backend count replaces 1");
+    expect(replaced.reading_rate == 2, "backend rate replaces 1");
+}
+
 static void test_sleep_floor_and_sim_reset() {
     expect(sleep_sec_v300(300) == 300, "v300 sleeps the whole 300s interval");
     expect(sleep_sec_v300(510) == 510, "v300 sleeps the whole 510s interval");
@@ -1022,6 +1063,7 @@ int main() {
     test_ota_confirm_counter();
     test_uplink_stale_and_deep_sleep_modem();
     test_yard_timing_units();
+    test_timing_defaults_then_backend();
     test_sleep_floor_and_sim_reset();
     test_confirmed_off_awake_cap_and_at_timeout();
     if (failures) {

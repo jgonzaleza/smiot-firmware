@@ -39,6 +39,47 @@ inline uint32_t clamp_i32_to_u32(long value, uint32_t lo, uint32_t hi) {
     return (uint32_t)value;
 }
 
+// Firmware defaults, used until a backend payload replaces a field.
+// v3.0.0 assigns these to the RTC variables at startup, then a payload
+// overwrites only the fields it carries. Sleep is seconds. The sensor
+// timings are milliseconds.
+static const uint32_t DEFAULT_SLEEP_SEC = 300;
+static const uint32_t DEFAULT_TIME_TO_READ_SENSOR = 5000;
+static const uint32_t DEFAULT_TIME_BETWEEN_READINGS = 2000;
+static const uint32_t DEFAULT_READING_COUNT = 1;
+static const uint32_t DEFAULT_READING_RATE = 1;
+
+struct DeviceTiming {
+    uint32_t sleep_sec;
+    uint32_t stabilize_ms;
+    uint32_t between_ms;
+    uint32_t reading_count;
+    uint32_t reading_rate;
+};
+
+struct BackendTiming {
+    bool has_sleep;
+    long sleep_sec;
+    bool has_stabilize;
+    long stabilize_ms;
+    bool has_between;
+    long between_ms;
+    bool has_count;
+    long reading_count;
+    bool has_rate;
+    long reading_rate;
+};
+
+inline DeviceTiming firmware_timing_defaults() {
+    DeviceTiming timing = {};
+    timing.sleep_sec = DEFAULT_SLEEP_SEC;
+    timing.stabilize_ms = DEFAULT_TIME_TO_READ_SENSOR;
+    timing.between_ms = DEFAULT_TIME_BETWEEN_READINGS;
+    timing.reading_count = DEFAULT_READING_COUNT;
+    timing.reading_rate = DEFAULT_READING_RATE;
+    return timing;
+}
+
 // Seconds. 300 stays 300.
 inline uint32_t configured_sleep_sec(long value) {
     return clamp_i32_to_u32(value, TTS_SEC_MIN, TTS_SEC_MAX);
@@ -55,6 +96,21 @@ inline uint32_t configured_stabilize_ms(long value) {
 inline uint32_t configured_between_ms(long value) {
     if (value <= 0) return 0;
     return (uint32_t)value;
+}
+
+// A present field replaces the current value. A missing field keeps it.
+// Millisecond fields are not passed through a seconds cap.
+inline DeviceTiming apply_backend_timing(DeviceTiming current, const BackendTiming& incoming) {
+    if (incoming.has_sleep) current.sleep_sec = configured_sleep_sec(incoming.sleep_sec);
+    if (incoming.has_stabilize) current.stabilize_ms = configured_stabilize_ms(incoming.stabilize_ms);
+    if (incoming.has_between) current.between_ms = configured_between_ms(incoming.between_ms);
+    if (incoming.has_count) {
+        current.reading_count = clamp_i32_to_u32(incoming.reading_count, R_COUNT_MIN, R_COUNT_MAX);
+    }
+    if (incoming.has_rate) {
+        current.reading_rate = clamp_i32_to_u32(incoming.reading_rate, R_RATE_MIN, R_RATE_MAX);
+    }
+    return current;
 }
 
 // Milliseconds. A missing value keeps the v3 default of 60000. Bounds are
