@@ -173,7 +173,7 @@ RTC_DATA_ATTR uint32_t TIME_TO_SLEEP_SEC = DEFAULT_SLEEP_SEC; // Time to sleep b
 #define DEFAULT_TIME_TO_SLEEP       540
 #define DEFAULT_TIME_TO_READ_SENSOR     12000L
 #define DEFAULT_READING_COUNT           1
-#define DEFAULT_TIME_BETWEEN_READINGS   1 // Time between readings in seconds
+#define DEFAULT_TIME_BETWEEN_READINGS   1 // Milliseconds. v3.0.0 passes this to delay().
 #define DEFAULT_READING_RATE            1 // How many readings
 #define DEFAULT_CHECK_PARAMETERS_UPDATE 3600000L
 #define DEFAULT_CHECK_GPS_UPDATE 86400000L
@@ -495,10 +495,10 @@ void mqtt_disconnect() {
 
 
 void clamp_runtime_params() {
-    TIME_TO_SLEEP_SEC = clamp_u32(TIME_TO_SLEEP_SEC, TTS_SEC_MIN, TTS_SEC_MAX);
-    TIME_TO_READ_SENSOR = clamp_u32(TIME_TO_READ_SENSOR, TTR_SENSOR_MIN_MS, TTR_SENSOR_MAX_MS);
+    TIME_TO_SLEEP_SEC = configured_sleep_sec((long)TIME_TO_SLEEP_SEC);
+    TIME_TO_READ_SENSOR = configured_stabilize_ms((long)TIME_TO_READ_SENSOR);
     READING_COUNT = clamp_u32(READING_COUNT, R_COUNT_MIN, R_COUNT_MAX);
-    if (TIME_BETWEEN_READINGS > TB_READINGS_MAX_SEC) TIME_BETWEEN_READINGS = TB_READINGS_MAX_SEC;
+    // TIME_BETWEEN_READINGS is milliseconds. Do not cap it at 120.
     READING_RATE = clamp_u32(READING_RATE, R_RATE_MIN, R_RATE_MAX);
     if (CHECK_FIRMWARE_UPDATE < C_F_UPDATE_MIN_MS) CHECK_FIRMWARE_UPDATE = C_F_UPDATE_MIN_MS;
     if (CHECK_FIRMWARE_UPDATE > C_F_UPDATE_MAX_MS) CHECK_FIRMWARE_UPDATE = C_F_UPDATE_MAX_MS;
@@ -629,19 +629,16 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
         daily_log_set_level_text(level.c_str());
     }
     if (!parameters_payload["TTS_SEC"].isNull()) {
-        TIME_TO_SLEEP_SEC = clamp_i32_to_u32(parameters_payload["TTS_SEC"].as<long>(), TTS_SEC_MIN, TTS_SEC_MAX);
+        TIME_TO_SLEEP_SEC = configured_sleep_sec(parameters_payload["TTS_SEC"].as<long>());
     }
     if (!parameters_payload["TTR_SENSOR"].isNull()) {
-        TIME_TO_READ_SENSOR = clamp_i32_to_u32(parameters_payload["TTR_SENSOR"].as<long>(), TTR_SENSOR_MIN_MS, TTR_SENSOR_MAX_MS);
+        TIME_TO_READ_SENSOR = configured_stabilize_ms(parameters_payload["TTR_SENSOR"].as<long>());
     }
     if (!parameters_payload["R_COUNT"].isNull()) {
         READING_COUNT = clamp_i32_to_u32(parameters_payload["R_COUNT"].as<long>(), R_COUNT_MIN, R_COUNT_MAX);
     }
     if (!parameters_payload["TB_READINGS"].isNull()) {
-        long gap = parameters_payload["TB_READINGS"].as<long>();
-        if (gap < 0) gap = 0;
-        if (gap > (long)TB_READINGS_MAX_SEC) gap = TB_READINGS_MAX_SEC;
-        TIME_BETWEEN_READINGS = (unsigned int)gap;
+        TIME_BETWEEN_READINGS = configured_between_ms(parameters_payload["TB_READINGS"].as<long>());
     }
     if (!parameters_payload["R_RATE"].isNull()) {
         READING_RATE = clamp_i32_to_u32(parameters_payload["R_RATE"].as<long>(), R_RATE_MIN, R_RATE_MAX);

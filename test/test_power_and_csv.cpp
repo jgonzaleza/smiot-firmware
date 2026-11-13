@@ -453,6 +453,23 @@ static void test_uplink_stale_and_deep_sleep_modem() {
     expect(UPLINK_STALE_SEC == 7200, "the stale window is 2 hours");
 }
 
+static void test_yard_timing_units() {
+    // Yard device-config. Sleep is seconds. The other three are milliseconds,
+    // the way v3.0.0 applies them: 5000 is 5s, 2000 is 2s.
+    expect(configured_sleep_sec(300) == 300, "sleep 300 stays 300 seconds");
+    expect(configured_stabilize_ms(5000) == 5000, "stabilize 5000 is 5000 ms");
+    expect(configured_between_ms(2000) == 2000, "between readings 2000 is 2000 ms");
+    expect(configured_max_wait_ms(5000, true) == 5000, "max wait 5000 is 5000 ms");
+    expect(configured_max_wait_ms(2000, true) == 2000, "max wait 2000 is 2000 ms");
+    expect(configured_max_wait_ms(0, false) == 60000, "a missing max wait stays the 60000 ms default");
+    // The 4.0.6 bug clamped the millisecond gap at 120 because that limit was in seconds.
+    expect(configured_between_ms(2000) != 120, "2000 ms is not cut to 120");
+    expect(configured_stabilize_ms(5000) != 120, "5000 ms is not cut to 120");
+    expect(configured_between_ms(120000) == 120000, "120000 ms stays 120s of delay, not a 120 cap");
+    expect(configured_stabilize_ms(5000) + configured_between_ms(2000) == 7000,
+           "one stabilize plus one gap is 7s, not minutes");
+}
+
 static void test_sleep_floor_and_sim_reset() {
     expect(sleep_sec_v300(300) == 300, "v300 sleeps the whole 300s interval");
     expect(sleep_sec_v300(510) == 510, "v300 sleeps the whole 510s interval");
@@ -1004,6 +1021,7 @@ int main() {
     test_radio_skip_clears_on_restart();
     test_ota_confirm_counter();
     test_uplink_stale_and_deep_sleep_modem();
+    test_yard_timing_units();
     test_sleep_floor_and_sim_reset();
     test_confirmed_off_awake_cap_and_at_timeout();
     if (failures) {
