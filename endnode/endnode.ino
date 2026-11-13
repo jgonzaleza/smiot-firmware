@@ -160,21 +160,16 @@ const int firmware_version = FIRMWARE_VERSION;
 #include "ota_verify.h"
 #include <mbedtls/sha256.h> 
 
-// Timing (Seconds)
+// Timing. Sleep is seconds. Sensor waits are milliseconds.
+// The numbers live in param_limits.h and stand until a backend payload replaces them.
 #define uS_TO_S_FACTOR 1000000ULL
-#define DEFAULT_SLEEP_SEC 510 // Default sleep time between measurements (5 mins)
-RTC_DATA_ATTR uint32_t TIME_TO_SLEEP_SEC = DEFAULT_SLEEP_SEC; // Time to sleep between measurements
+RTC_DATA_ATTR uint32_t TIME_TO_SLEEP_SEC = DEFAULT_SLEEP_SEC;
 
 // Queue and Storage
 #define maximumReadings 2000 // The maximum number of readings that can be stored in the available space
 
 //Sensor Default Config
 #define DEFAULT_BAUD_RATE 9600
-#define DEFAULT_TIME_TO_SLEEP       540
-#define DEFAULT_TIME_TO_READ_SENSOR     12000L
-#define DEFAULT_READING_COUNT           1
-#define DEFAULT_TIME_BETWEEN_READINGS   1 // Time between readings in seconds
-#define DEFAULT_READING_RATE            1 // How many readings
 #define DEFAULT_CHECK_PARAMETERS_UPDATE 3600000L
 #define DEFAULT_CHECK_GPS_UPDATE 86400000L
 RTC_DATA_ATTR unsigned int TIME_TO_READ_SENSOR = DEFAULT_TIME_TO_READ_SENSOR;
@@ -495,10 +490,10 @@ void mqtt_disconnect() {
 
 
 void clamp_runtime_params() {
-    TIME_TO_SLEEP_SEC = clamp_u32(TIME_TO_SLEEP_SEC, TTS_SEC_MIN, TTS_SEC_MAX);
-    TIME_TO_READ_SENSOR = clamp_u32(TIME_TO_READ_SENSOR, TTR_SENSOR_MIN_MS, TTR_SENSOR_MAX_MS);
+    TIME_TO_SLEEP_SEC = configured_sleep_sec((long)TIME_TO_SLEEP_SEC);
+    TIME_TO_READ_SENSOR = configured_stabilize_ms((long)TIME_TO_READ_SENSOR);
     READING_COUNT = clamp_u32(READING_COUNT, R_COUNT_MIN, R_COUNT_MAX);
-    if (TIME_BETWEEN_READINGS > TB_READINGS_MAX_SEC) TIME_BETWEEN_READINGS = TB_READINGS_MAX_SEC;
+    // TIME_BETWEEN_READINGS is milliseconds. Do not cap it at 120.
     READING_RATE = clamp_u32(READING_RATE, R_RATE_MIN, R_RATE_MAX);
     if (CHECK_FIRMWARE_UPDATE < C_F_UPDATE_MIN_MS) CHECK_FIRMWARE_UPDATE = C_F_UPDATE_MIN_MS;
     if (CHECK_FIRMWARE_UPDATE > C_F_UPDATE_MAX_MS) CHECK_FIRMWARE_UPDATE = C_F_UPDATE_MAX_MS;
@@ -628,24 +623,39 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
         String level = parameters_payload["LOG_LEVEL"].as<String>();
         daily_log_set_level_text(level.c_str());
     }
+    DeviceTiming timing;
+    timing.sleep_sec = TIME_TO_SLEEP_SEC;
+    timing.stabilize_ms = TIME_TO_READ_SENSOR;
+    timing.between_ms = TIME_BETWEEN_READINGS;
+    timing.reading_count = READING_COUNT;
+    timing.reading_rate = READING_RATE;
+    BackendTiming incoming = {};
     if (!parameters_payload["TTS_SEC"].isNull()) {
-        TIME_TO_SLEEP_SEC = clamp_i32_to_u32(parameters_payload["TTS_SEC"].as<long>(), TTS_SEC_MIN, TTS_SEC_MAX);
+        incoming.has_sleep = true;
+        incoming.sleep_sec = parameters_payload["TTS_SEC"].as<long>();
     }
     if (!parameters_payload["TTR_SENSOR"].isNull()) {
-        TIME_TO_READ_SENSOR = clamp_i32_to_u32(parameters_payload["TTR_SENSOR"].as<long>(), TTR_SENSOR_MIN_MS, TTR_SENSOR_MAX_MS);
+        incoming.has_stabilize = true;
+        incoming.stabilize_ms = parameters_payload["TTR_SENSOR"].as<long>();
     }
     if (!parameters_payload["R_COUNT"].isNull()) {
-        READING_COUNT = clamp_i32_to_u32(parameters_payload["R_COUNT"].as<long>(), R_COUNT_MIN, R_COUNT_MAX);
+        incoming.has_count = true;
+        incoming.reading_count = parameters_payload["R_COUNT"].as<long>();
     }
     if (!parameters_payload["TB_READINGS"].isNull()) {
-        long gap = parameters_payload["TB_READINGS"].as<long>();
-        if (gap < 0) gap = 0;
-        if (gap > (long)TB_READINGS_MAX_SEC) gap = TB_READINGS_MAX_SEC;
-        TIME_BETWEEN_READINGS = (unsigned int)gap;
+        incoming.has_between = true;
+        incoming.between_ms = parameters_payload["TB_READINGS"].as<long>();
     }
     if (!parameters_payload["R_RATE"].isNull()) {
-        READING_RATE = clamp_i32_to_u32(parameters_payload["R_RATE"].as<long>(), R_RATE_MIN, R_RATE_MAX);
+        incoming.has_rate = true;
+        incoming.reading_rate = parameters_payload["R_RATE"].as<long>();
     }
+    timing = apply_backend_timing(timing, incoming);
+    TIME_TO_SLEEP_SEC = timing.sleep_sec;
+    TIME_TO_READ_SENSOR = timing.stabilize_ms;
+    READING_COUNT = timing.reading_count;
+    TIME_BETWEEN_READINGS = timing.between_ms;
+    READING_RATE = timing.reading_rate;
     if (!parameters_payload["G_GPS_DATA"].isNull()) {
         get_gps_data = command_flag_on(parameters_payload["G_GPS_DATA"]);
     }

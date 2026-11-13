@@ -32,9 +32,7 @@ void init_peripherals() {
 void wait_for_sensors(){
     unsigned long phase_start = millis();
     unsigned long elapsed_time = millis() - start_time;
-    unsigned long cap = TIME_TO_READ_SENSOR;
-    if (cap < TTR_SENSOR_MIN_MS) cap = TTR_SENSOR_MIN_MS;
-    if (cap > TTR_SENSOR_MAX_MS) cap = TTR_SENSOR_MAX_MS;
+    unsigned long cap = configured_stabilize_ms((long)TIME_TO_READ_SENSOR);
     while (elapsed_time < cap) {
         if (phase_deadline_hit(phase_start, cap + 1000UL)) {
             local_logger("wait_for_sensors deadline");
@@ -438,9 +436,9 @@ bool get_sensor_configuration(bool show_status) {
         item.stat_reg = sensor_config["STAT_REG"] | 1;
         item.ready_val = sensor_config["READY_VAL"] | 3;
         item.warmup_val = sensor_config["WARMUP_VAL"] | 1;
-        item.max_wait_ms = sensor_config["MAX_WAIT_MS"] | 60000;
-        if (item.max_wait_ms < 1000) item.max_wait_ms = 1000;
-        if (item.max_wait_ms > 180000) item.max_wait_ms = 180000;
+        item.max_wait_ms = configured_max_wait_ms(
+            sensor_config["MAX_WAIT_MS"].as<long>(),
+            !sensor_config["MAX_WAIT_MS"].isNull());
 
         char name_tokens[CSV_MAX_TOKENS][CSV_TOKEN_MAX + 1];
         bool names_truncated = false;
@@ -741,11 +739,15 @@ String get_final_sensor_payload(){
             }
             preferences.end();                        
         }
-        unsigned long gap_sec = TIME_BETWEEN_READINGS;
-        if (gap_sec > TB_READINGS_MAX_SEC) gap_sec = TB_READINGS_MAX_SEC;
-        for (unsigned long sec = 0; sec < gap_sec; sec++) {
-            delay(1000);
+        // v3.0.0: delay(TIME_BETWEEN_READINGS). The number is milliseconds.
+        // 2000 waits 2s. Chunked so a long gap still feeds the watchdog,
+        // and the chunks add up to the configured value.
+        uint32_t left = configured_between_ms((long)TIME_BETWEEN_READINGS);
+        while (left > 0) {
+            uint32_t step = left > 1000u ? 1000u : left;
+            delay(step);
             feed_watchdog();
+            left -= step;
         }
     }
 

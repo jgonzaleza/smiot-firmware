@@ -453,6 +453,64 @@ static void test_uplink_stale_and_deep_sleep_modem() {
     expect(UPLINK_STALE_SEC == 7200, "the stale window is 2 hours");
 }
 
+static void test_yard_timing_units() {
+    // Yard device-config. Sleep is seconds. The other three are milliseconds,
+    // the way v3.0.0 applies them: 5000 is 5s, 2000 is 2s.
+    expect(configured_sleep_sec(300) == 300, "sleep 300 stays 300 seconds");
+    expect(configured_stabilize_ms(5000) == 5000, "stabilize 5000 is 5000 ms");
+    expect(configured_between_ms(2000) == 2000, "between readings 2000 is 2000 ms");
+    expect(configured_max_wait_ms(5000, true) == 5000, "max wait 5000 is 5000 ms");
+    expect(configured_max_wait_ms(2000, true) == 2000, "max wait 2000 is 2000 ms");
+    expect(configured_max_wait_ms(0, false) == 60000, "a missing max wait stays the 60000 ms default");
+    // The 4.0.6 bug clamped the millisecond gap at 120 because that limit was in seconds.
+    expect(configured_between_ms(2000) != 120, "2000 ms is not cut to 120");
+    expect(configured_stabilize_ms(5000) != 120, "5000 ms is not cut to 120");
+    expect(configured_between_ms(120000) == 120000, "120000 ms stays 120s of delay, not a 120 cap");
+    expect(configured_stabilize_ms(5000) + configured_between_ms(2000) == 7000,
+           "one stabilize plus one gap is 7s, not minutes");
+}
+
+static void test_timing_defaults_then_backend() {
+    DeviceTiming fresh = firmware_timing_defaults();
+    expect(fresh.sleep_sec == 300, "default sleep is 300 seconds");
+    expect(fresh.stabilize_ms == 5000, "default stabilize is 5000 ms");
+    expect(fresh.between_ms == 2000, "default gap is 2000 ms");
+    expect(fresh.reading_count == 1, "default reading count is 1");
+    expect(fresh.reading_rate == 1, "default reading rate is 1");
+    expect(DEFAULT_SLEEP_SEC == 300, "sleep default constant is 300");
+    expect(DEFAULT_TIME_TO_READ_SENSOR == 5000, "stabilize default constant is 5000");
+    expect(DEFAULT_TIME_BETWEEN_READINGS == 2000, "gap default constant is 2000");
+    expect(DEFAULT_READING_COUNT == 1, "count default constant is 1");
+    expect(DEFAULT_READING_RATE == 1, "rate default constant is 1");
+
+    BackendTiming none = {};
+    DeviceTiming untouched = apply_backend_timing(fresh, none);
+    expect(untouched.sleep_sec == 300, "an empty payload keeps sleep at 300s");
+    expect(untouched.stabilize_ms == 5000, "an empty payload keeps stabilize at 5000 ms");
+    expect(untouched.between_ms == 2000, "an empty payload keeps the gap at 2000 ms");
+    expect(untouched.reading_count == 1, "an empty payload keeps count at 1");
+    expect(untouched.reading_rate == 1, "an empty payload keeps rate at 1");
+
+    BackendTiming override = {};
+    override.has_sleep = true;
+    override.sleep_sec = 600;
+    override.has_stabilize = true;
+    override.stabilize_ms = 8000;
+    override.has_between = true;
+    override.between_ms = 4000;
+    override.has_count = true;
+    override.reading_count = 2;
+    override.has_rate = true;
+    override.reading_rate = 2;
+    DeviceTiming replaced = apply_backend_timing(fresh, override);
+    expect(replaced.sleep_sec == 600, "backend sleep replaces 300s");
+    expect(replaced.stabilize_ms == 8000, "backend stabilize replaces 5000 ms");
+    expect(replaced.between_ms == 4000, "backend gap replaces 2000 ms and stays milliseconds");
+    expect(replaced.between_ms != 120, "a 4000 ms gap is not cut to 120");
+    expect(replaced.reading_count == 2, "backend count replaces 1");
+    expect(replaced.reading_rate == 2, "backend rate replaces 1");
+}
+
 static void test_sleep_floor_and_sim_reset() {
     expect(sleep_sec_v300(300) == 300, "v300 sleeps the whole 300s interval");
     expect(sleep_sec_v300(510) == 510, "v300 sleeps the whole 510s interval");
@@ -1004,6 +1062,8 @@ int main() {
     test_radio_skip_clears_on_restart();
     test_ota_confirm_counter();
     test_uplink_stale_and_deep_sleep_modem();
+    test_yard_timing_units();
+    test_timing_defaults_then_backend();
     test_sleep_floor_and_sim_reset();
     test_confirmed_off_awake_cap_and_at_timeout();
     if (failures) {
