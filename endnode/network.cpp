@@ -70,91 +70,6 @@ static void capture_registered_plmn() {
     local_logger("Registered PLMN: ", registered_plmn);
 }
 
-static void modem_reset_deassert() {
-#ifdef MODEM_RESET_PIN
-    // Program the idle level before releasing the hold. A hold release
-    // with the pin still unconfigured glitches the active-low reset.
-    pinMode(MODEM_RESET_PIN, OUTPUT);
-    digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
-    gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
-    digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
-#endif
-}
-
-void modem_release_sleep_pins() {
-    modem_reset_deassert();
-    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
-    digitalWrite(BOARD_PWRKEY_PIN, LOW);
-    gpio_hold_dis((gpio_num_t)BOARD_PWRKEY_PIN);
-    digitalWrite(BOARD_PWRKEY_PIN, LOW);
-}
-
-static void modem_hard_reset() {
-#ifdef MODEM_RESET_PIN
-    modem_reset_deassert();
-    delay(100);
-    digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL);
-    delay(2600);
-    digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
-#endif
-}
-
-// Board PWRKEY is active-high into a transistor, so a high pulse presses
-// the modem key. On the A7608 that key toggles power. high_ms is the
-// press width: 100-500ms turns a module on, and about 1000ms can turn
-// one that is already on back off.
-static void modem_pwrkey_pulse(uint32_t high_ms) {
-    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
-    digitalWrite(BOARD_PWRKEY_PIN, LOW);
-    delay(100);
-    digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-    delay(high_ms);
-    digitalWrite(BOARD_PWRKEY_PIN, LOW);
-}
-
-static bool modem_wait_at(int attempts) {
-    for (int i = 0; i < attempts; i++) {
-        feed_watchdog();
-        if (modem.testAT(1000)) return true;
-    }
-    return false;
-}
-
-// Hard reset, then the on-pulse, then AT. retry_ms is the v3 1000ms press
-// used only when AT stays down. It is not the 200ms pulse.
-static bool modem_cold_boot(uint32_t on_ms, uint32_t retry_ms) {
-    modem_hard_reset();
-    modem_pwrkey_pulse(on_ms);
-    delay(1000);
-    bool at_ok = false;
-    int retry = 0;
-    int k = 50;
-    while (!(at_ok = modem.testAT(1000)) && k > 0) {
-        feed_watchdog();
-        if (awake_budget_expired()) break;
-        k--;
-        if (retry++ > 10) {
-            modem_pwrkey_pulse(retry_ms);
-            retry = 0;
-        }
-    }
-    return at_ok;
-}
-
-// The module answered AT. Press the key until it stops, bounded.
-// 1000ms is the width that powers this board's already-on A7608 down.
-static bool modem_force_off() {
-    uint32_t start = millis();
-    while (millis() - start < MODEM_CPOF_BUDGET_MS) {
-        feed_watchdog();
-        if (awake_budget_expired()) break;
-        modem_pwrkey_pulse(MODEM_PWRKEY_RETRY_MS);
-        delay(300);
-        if (!modem.testAT(500)) return true;
-    }
-    return !modem.testAT(300);
-}
-
 // 1 ready, 2 locked, 0 not ready or no answer.
 // getSimStatus() treats "NOT READY" as READY because endsWith("READY") wins.
 static int modem_cpin_state() {
@@ -167,13 +82,21 @@ static int modem_cpin_state() {
     return 0;
 }
 
+// v3.0.0 go_sleep (endnode/endnode.ino, tag v3.0.0). Stop when AT+CPOF
+// is accepted, wait 5s, then wait until AT stops answering.
 void power_off_modem_for_sleep() {
-    uint32_t start = millis();
-    while (millis() - start < MODEM_CPOF_BUDGET_MS) {
+    int i = MODEM_CPOF_TRIES;
+    while (!modem.poweroff() && i > 0) {
         feed_watchdog();
-        modem.poweroff();
-        delay(500);
-        if (!modem.testAT(500)) return;
+        i--;
+        delay(MODEM_CPOF_GAP_MS);
+    }
+    delay(MODEM_CPOF_SETTLE_MS);
+    int k = MODEM_CPOF_AT_TRIES;
+    while (modem.testAT() && k > 0) {
+        feed_watchdog();
+        delay(1000);
+        k--;
     }
 }
 
@@ -188,27 +111,46 @@ void init_modem() {
     gpio_hold_dis((gpio_num_t)BOARD_SD_CS_PIN);
     gpio_deep_sleep_hold_dis();
 
-    pinMode(MODEM_DTR_PIN, OUTPUT);
-    digitalWrite(MODEM_DTR_PIN, LOW);
+#ifdef BOARD_POWERON_PIN
+    pinMode(BOARD_POWERON_PIN, OUTPUT);
+    digitalWrite(BOARD_POWERON_PIN, HIGH);
+#endif
 
-    // Deep sleep: the module must be off before the v3 on-sequence.
-    // A short sleep can leave it answering AT (PWRKEY floated, or it
-    // restarted on VBAT). 200ms does not reset that state. Power it off
-    // with the 1000ms press, then RESET plus the 100ms on-pulse. If AT
-    // stays down, retry with 1000ms, which is v3's retry. Power-on and
-    // software restart keep the 1000ms on-pulse that brings a cold module up.
-    modem_release_sleep_pins();
+#ifdef MODEM_RESET_PIN
+    // v3.0.0: release the sleep hold, then reset. The module starts
+    // during the reset pulse. hold_dis comes before pinMode, as in v3.
+    gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
+    pinMode(MODEM_RESET_PIN, OUTPUT);
+    digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL); delay(100);
+    digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL); delay(2600);
+    digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
+#endif
+
+    pinMode(MODEM_DTR_PIN, OUTPUT);
+    digitalWrite(MODEM_DTR_PIN, HIGH);
+
+    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+    delay(100);
+    digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+    delay(MODEM_PWRKEY_ON_MS);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+
+    delay(1000);
+    int retry = 0;
     bool at_ok = false;
-    if (modem_wake_from_deep_sleep((int)esp_reset_reason())) {
-        bool at_up = modem_wait_at(3);
-        if (deep_sleep_bringup(at_up) == DEEP_SLEEP_FORCE_OFF) {
-            daily_log_net_branch("pwr_off");
-            local_logger("Modem is on after deep sleep. Powering it off before reset.");
-            modem_force_off();
+    int k = MODEM_AT_PROBES;
+    while (!(at_ok = modem.testAT(1000)) && k > 0) {
+        feed_watchdog();
+        k--;
+        if (v300_pwrkey_retry_due(retry)) {
+            digitalWrite(BOARD_PWRKEY_PIN, LOW);
+            delay(100);
+            digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+            delay(MODEM_PWRKEY_RETRY_MS);
+            digitalWrite(BOARD_PWRKEY_PIN, LOW);
+            retry = 0;
         }
-        at_ok = modem_cold_boot(MODEM_PWRKEY_ON_MS, MODEM_PWRKEY_RETRY_MS);
-    } else {
-        at_ok = modem_cold_boot(1000, MODEM_PWRKEY_RETRY_MS);
     }
     daily_log_net_at(at_ok ? 1 : 0);
     if (!at_ok) daily_log_net_reason("at_fail");

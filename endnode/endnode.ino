@@ -1,5 +1,5 @@
 /**
- * Smart IoT End Node Firmware 4.0.4
+ * Smart IoT End Node Firmware 4.0.5
  * Board: Lilygo A7608X-S3
  * Flow: Init -> HTTPS Config/Update -> Read Sensors  -> MQTT Upload -> Store RTC( SD optional) -> Deep Sleep
  * Date: Junio 2026
@@ -30,6 +30,10 @@
  *                    state (1000ms PWRKEY retry, not 200ms). Hold PWRKEY
  *                    low across sleep. AT reads honor their timeout.
  *                    First boot stops at the awake budget.
+ * Change Log: 4.0.5 - Modem power-on, power-off, and sleep pins are the
+ *                    v3.0.0 sequence again. PWRKEY is not held across
+ *                    sleep. First-boot awake caps, the AT-read timeout,
+ *                    and the NOT READY check stay.
  */
 
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
@@ -1041,22 +1045,18 @@ void go_sleep(){
     digitalWrite(MODEM_DTR_PIN, LOW);
 
     #ifdef MODEM_RESET_PIN
+        // v3.0.0: hold reset inactive across sleep so a wake glitch
+        // cannot start the module. PWRKEY is not touched and not held.
         digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
         gpio_hold_en((gpio_num_t)MODEM_RESET_PIN);
+        gpio_deep_sleep_hold_en();
     #endif
-    // GPIO 15 floats during deep sleep unless held. A float presses the
-    // key for the whole 20s floor and the module is already on at wake.
-    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
-    digitalWrite(BOARD_PWRKEY_PIN, LOW);
-    gpio_hold_en((gpio_num_t)BOARD_PWRKEY_PIN);
-    gpio_deep_sleep_hold_en();
 
     #ifdef DEBUG
         Serial.println("Weather Station is going to  deep sleep!");
     #endif
 
-    uint32_t awake_sec = (millis() - g_wake_start_ms) / 1000UL;
-    uint32_t sleep_sec = sleep_sec_after_wake(awake_sec, active_sleep_sec);
+    uint32_t sleep_sec = sleep_sec_v300(active_sleep_sec);
     esp_sleep_enable_timer_wakeup((uint64_t)sleep_sec * uS_TO_S_FACTOR);
     delay(200);
 
