@@ -37,6 +37,7 @@
  * Change Log: 4.0.6 - Sensor rail and RS485 stay off until the modem
  *                    and uplink finish. turn_sensors_off drops the rail.
  *                    CPIN continues on NOT READY, as in v3.0.0.
+ *                    Sleep at least 120s. A shorter remainder becomes 120s.
  */
 
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
@@ -1059,7 +1060,8 @@ void go_sleep(){
         Serial.println("Weather Station is going to  deep sleep!");
     #endif
 
-    uint32_t sleep_sec = sleep_sec_v300(active_sleep_sec);
+    uint32_t awake_sec = (millis() - g_wake_start_ms) / 1000UL;
+    uint32_t sleep_sec = sleep_sec_at_least(awake_sec, active_sleep_sec);
     esp_sleep_enable_timer_wakeup((uint64_t)sleep_sec * uS_TO_S_FACTOR);
     delay(200);
 

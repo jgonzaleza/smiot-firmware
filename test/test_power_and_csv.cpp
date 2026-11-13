@@ -456,7 +456,14 @@ static void test_uplink_stale_and_deep_sleep_modem() {
 static void test_sleep_floor_and_sim_reset() {
     expect(sleep_sec_v300(300) == 300, "v300 sleeps the whole 300s interval");
     expect(sleep_sec_v300(510) == 510, "v300 sleeps the whole 510s interval");
-    expect(sleep_sec_v300(300) == 300, "a wake past the interval still sleeps the whole interval");
+    expect(MIN_SLEEP_AFTER_WAKE_SEC == 120, "the minimum sleep is 120s, not the old 20s floor");
+    expect(sleep_sec_at_least(100, 300) == 200, "a 200s remainder stays 200s");
+    expect(sleep_sec_at_least(0, 300) == 300, "a zero awake time sleeps the whole interval");
+    expect(sleep_sec_at_least(180, 300) == 120, "a 120s remainder stays 120s");
+    expect(sleep_sec_at_least(181, 300) == 120, "a remainder under 120s sleeps 120s");
+    expect(sleep_sec_at_least(333, 300) == 120, "a wake past the interval sleeps 120s");
+    expect(sleep_sec_at_least(391, 510) == 120, "510 minus 391 is under 120s, so sleep 120s");
+    expect(sleep_sec_at_least(200, 510) == 310, "510 minus 200 stays the remainder");
     expect(MODEM_CPOF_TRIES == 60, "CPOF is tried up to 60 times");
     expect(MODEM_CPOF_GAP_MS == 500, "CPOF retries are 500ms apart");
     expect(MODEM_CPOF_SETTLE_MS == 5000, "CPOF then waits 5 seconds");
