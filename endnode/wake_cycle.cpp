@@ -93,6 +93,11 @@ void boot_start(WakeState& wake) {
     queue_manager_init();
     init_relay();
     feed_watchdog();
+    if (first_run) {
+        // v3.0.0 pulses the rain pin on a first start, after the 30 s wait.
+        reset_sensor();
+        feed_watchdog();
+    }
 }
 
 void network_provision(WakeState& wake) {
