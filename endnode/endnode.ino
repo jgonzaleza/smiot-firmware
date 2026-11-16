@@ -1,5 +1,5 @@
 /**
- * Smart IoT End Node Firmware 4.0.6
+ * Smart IoT End Node Firmware 4.0.8
  * Board: Lilygo A7608X-S3
  * Flow: Init -> HTTPS Config/Update -> Read Sensors  -> MQTT Upload -> Store RTC( SD optional) -> Deep Sleep
  * Date: Junio 2026
@@ -38,6 +38,9 @@
  *                    and uplink finish. turn_sensors_off drops the rail.
  *                    CPIN continues on NOT READY, as in v3.0.0.
  *                    Sleep at least 120s. A shorter remainder becomes 120s.
+ * Change Log: 4.0.8 - Optional SENSOR_CMD in the parameters message.
+ *                    Function 06 and 16 go out through ModbusMaster.
+ *                    A successful command restarts as a first start.
  */
 
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
@@ -63,6 +66,7 @@
 #include "sketch_config.h"
 #include "wake_policy.h"
 #include "variant.h"
+#include "sensor_cmd.h"
 
 // External Libraries
 #include <ModbusMaster.h>
@@ -454,7 +458,22 @@ void perform_restart() {
 
     // 5. Wait a moment
     delay(1000);
-    
+
+    // RtcPersist survives ESP.restart(), so a software restart is not a first
+    // start unless we mark it. The unsent queue stays: spillover moved the
+    // RTC pool to the SD card when it could, and this does not wipe the pool.
+    // The saved fix is also in Preferences, and the next boot reloads it.
+    first_run = 1;
+    local_lat2 = 0.0f;
+    local_lon2 = 0.0f;
+    gps_fail_streak = 0;
+    if (preferences.begin("devcfg", false)) {
+        preferences.putFloat("lat", 0.0f);
+        preferences.putFloat("lon", 0.0f);
+        preferences.end();
+    }
+    rtc_persist_commit();
+
     // 6. Reset
     ESP.restart();
 }
@@ -561,6 +580,23 @@ void load_device_params() {
     rtc_persist_commit();
 }
 
+// CMD_ID is present when the key exists and is a number, including 0.
+// A string, bool, object, or array does not count.
+static bool sensor_cmd_id_from_payload(JsonVariant cmd, uint32_t* id_out) {
+    if (!id_out || !cmd.is<JsonObject>() || cmd["CMD_ID"].isNull()) return false;
+    JsonVariant id_value = cmd["CMD_ID"];
+    if (id_value.is<bool>() || id_value.is<const char*>() || id_value.is<JsonObject>() || id_value.is<JsonArray>()) {
+        return false;
+    }
+    long raw = id_value.as<long>();
+    if (raw <= 0) {
+        *id_out = 0;
+        return true;
+    }
+    *id_out = (uint32_t)raw;
+    return true;
+}
+
 // JSON true, or any non-zero number. as<bool>() is not enough: ArduinoJson 7
 // returns false for the 1 the backend sends.
 static bool command_flag_on(JsonVariant value) {
@@ -606,10 +642,15 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
     const bool rr_on = command_flag_on(rr_value);
     const bool pulse_rain = rain_pulse_due(rr_on, g_rtc.rr_prev != 0);
 
-    // Retained messages (60 s) are delivered again on the next connect.
+    uint32_t sensor_cmd_id = 0;
+    const bool sensor_cmd_present = sensor_cmd_id_from_payload(parameters_payload["SENSOR_CMD"], &sensor_cmd_id);
+    const bool sensor_cmd_runs = sensor_cmd_should_run(sensor_cmd_present, sensor_cmd_id, sensor_cmd_finished_id());
+
+    // Retained messages are delivered again on the next connect.
     // Skip them when the body and the restart id are unchanged and the rain
-    // command is not a rising edge. A repeated 1 stays quiet; 0 then 1 pulses.
-    if (hash == g_rtc.param_hash && !restart_requested && !pulse_rain) {
+    // command is not a rising edge. A new SENSOR_CMD id still runs when the
+    // rest of the body was already applied. A repeated 1 stays quiet; 0 then 1 pulses.
+    if (sensor_cmd_parameters_unchanged(hash == g_rtc.param_hash, restart_requested, pulse_rain, sensor_cmd_runs)) {
         parameters_payload.clear();
         return;
     }
@@ -690,6 +731,30 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
     if (pulse_rain) {
         local_logger("Reset rain sensor command received");
         reset_sensor();
+    }
+
+    if (sensor_cmd_runs) {
+        JsonVariant cmd = parameters_payload["SENSOR_CMD"];
+        const char* sensor_id = "";
+        const char* frame = "";
+        bool has_baud = false;
+        long baud = 0;
+        if (cmd["SENSOR_ID"].is<const char*>()) {
+            const char* id = cmd["SENSOR_ID"].as<const char*>();
+            if (id) sensor_id = id;
+        }
+        if (cmd["FRAME"].is<const char*>()) {
+            const char* text = cmd["FRAME"].as<const char*>();
+            if (text) frame = text;
+        }
+        JsonVariant baud_value = cmd["BAUD"];
+        if (!baud_value.isNull() && !baud_value.is<bool>() && !baud_value.is<const char*>()
+            && !baud_value.is<JsonObject>() && !baud_value.is<JsonArray>()) {
+            has_baud = true;
+            baud = baud_value.as<long>();
+        }
+        // A successful write restarts and does not return.
+        sensor_cmd_execute(sensor_cmd_id, sensor_id, frame, has_baud, baud);
     }
 
     parameters_payload.clear();
@@ -1135,6 +1200,14 @@ String get_final_payload(String sensors_payload, String gps_payload, bool result
     if (announce_power_mode) {
         doc["evt"] = "MODE_CHANGE";
         doc["pack_v"] = last_pack_volts;
+    }
+
+    SensorCmdAttach sensor_cmd;
+    if (sensor_cmd_load_pending(&sensor_cmd)) {
+        doc["sc_id"] = sensor_cmd.id;
+        doc["sc_ok"] = sensor_cmd.ok;
+        doc["sc_err"] = sensor_cmd.err;
+        doc["sc_rsp"] = sensor_cmd.rsp;
     }
 
     if (!is_sdcard_ok) {

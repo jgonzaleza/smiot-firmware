@@ -19,6 +19,7 @@ Host checks for the CSV parser and the pack-voltage policy:
 
 ```bash
 c++ -std=c++17 test/test_power_and_csv.cpp -Iendnode -o /tmp/firmware-tests && /tmp/firmware-tests
+c++ -std=c++17 test/test_sensor_cmd.cpp -Iendnode -o /tmp/sensor-cmd-tests && /tmp/sensor-cmd-tests
 ```
 
 ## Secrets
