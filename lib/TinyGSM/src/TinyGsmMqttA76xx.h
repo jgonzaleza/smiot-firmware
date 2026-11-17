@@ -11,6 +11,19 @@
 #include <string.h>
 
 #define TINY_GSM_MQTT_CLI_COUNT 2
+
+#if defined(ESP32)
+extern "C" int ets_printf(const char* fmt, ...);
+#endif
+
+static inline void tinygsm_log_mqtt_overflow()
+{
+#if defined(ESP32)
+    ets_printf("MQTT RX buffer overflow, message dropped\n");
+#else
+    DBG("MQTT RX buffer overflow, message dropped");
+#endif
+}
 // Shorter than this is not a certificate or key. Longer than this is past
 // what AT+CCERTDOWN can store on the A7608.
 #define TINY_GSM_PEM_MIN_BYTES 64
@@ -437,55 +450,81 @@ public:
         // +CMQTTCONNLOST: 1,1
         if (thisModem().waitResponse(timeout, "+CMQTTRXSTART:") == 1) {
             thisModem().streamSkipUntil(',');
-            size_t topicSize = 0;
-            size_t plyloadSize = 0;
-            size_t topic_total_len =  thisModem().streamGetIntBefore(',');
-            size_t payload_total_len =  thisModem().streamGetIntBefore('\n');
+            int topic_len_i = thisModem().streamGetIntBefore(',');
+            int payload_len_i = thisModem().streamGetIntBefore('\n');
             if (thisModem().waitResponse(timeout, "+CMQTTRXTOPIC:") == 1) {
-
                 thisModem().streamSkipUntil('\n');
-                topicSize = topic_total_len > bufferSize ? bufferSize - 1 : topic_total_len;
-                thisModem().stream.readBytes(buffer, topicSize);
-                buffer[topicSize] = '\0';
-                topicSize += 1;
 
-                if (topicSize == bufferSize) {
-                    DBG("Buffer overflow!");
-                    thisModem().waitResponse(10000UL);
+                auto discard_bytes = [&](size_t count) {
+                    uint8_t trash[64];
+                    while (count > 0) {
+                        size_t n = count > sizeof(trash) ? sizeof(trash) : count;
+                        size_t got = thisModem().stream.readBytes(trash, n);
+                        if (got == 0) return;
+                        count -= got;
+                    }
+                };
+
+                bool overflow = topic_len_i < 0 || payload_len_i < 0 || this->buffer == NULL || this->bufferSize < 2;
+                size_t topic_total_len = topic_len_i > 0 ? (size_t)topic_len_i : 0;
+                size_t payload_total_len = payload_len_i > 0 ? (size_t)payload_len_i : 0;
+                size_t topicStored = 0;
+
+                if (!overflow && topic_total_len + 1 > this->bufferSize) overflow = true;
+                if (overflow) {
+                    discard_bytes(topic_total_len);
+                } else {
+                    size_t got = thisModem().stream.readBytes(this->buffer, topic_total_len);
+                    if (got != topic_total_len) {
+                        overflow = true;
+                        if (topic_total_len > got) discard_bytes(topic_total_len - got);
+                    } else {
+                        this->buffer[topic_total_len] = '\0';
+                        topicStored = topic_total_len + 1;
+                    }
+                }
+
+                size_t payloadStored = 0;
+                size_t payloadSeen = 0;
+                size_t bufferOffset = topicStored;
+                while (payloadSeen < payload_total_len) {
+                    if (thisModem().waitResponse(timeout, "+CMQTTRXPAYLOAD:") != 1) break;
+                    thisModem().streamSkipUntil(',');
+                    int packetSize = thisModem().streamGetIntBefore('\n');
+                    if (packetSize <= 0) break;
+                    size_t chunk = (size_t)packetSize;
+                    if (payloadSeen + chunk < payloadSeen) {
+                        overflow = true;
+                        break;
+                    }
+                    size_t room = bufferOffset < this->bufferSize ? (size_t)(this->bufferSize - bufferOffset) : 0;
+                    if (!overflow && chunk <= room && payloadSeen + chunk <= payload_total_len) {
+                        size_t got = thisModem().stream.readBytes(this->buffer + bufferOffset, chunk);
+                        bufferOffset += got;
+                        payloadStored += got;
+                        if (got != chunk) {
+                            overflow = true;
+                            if (chunk > got) discard_bytes(chunk - got);
+                        }
+                    } else {
+                        overflow = true;
+                        discard_bytes(chunk);
+                    }
+                    payloadSeen += chunk;
+                }
+
+                bool got_end = thisModem().waitResponse(timeout, "+CMQTTRXEND: 0") == 1;
+                if (overflow || payloadSeen != payload_total_len) {
+                    if (overflow) tinygsm_log_mqtt_overflow();
+                    if (this->buffer && this->bufferSize) memset(this->buffer, 0, this->bufferSize);
                     return false;
                 }
-                size_t recvSize = 0;
-                size_t remainingSize = bufferSize - topicSize;
-                size_t bufferOffset = topicSize;
-
-                do {
-                    if (thisModem().waitResponse(timeout, "+CMQTTRXPAYLOAD:") == 1) {
-                        thisModem().streamSkipUntil(',');
-                        int packetSize = thisModem().streamGetIntBefore('\n');
-
-                        plyloadSize = packetSize > remainingSize ? remainingSize : packetSize;
-
-                        if (bufferOffset >= bufferSize) {
-                            DBG("Buffer overflow!");
-                            break;
-                        }
-                        thisModem().stream.readBytes(buffer + bufferOffset, plyloadSize);
-
-                        remainingSize -= plyloadSize;
-                        bufferOffset += plyloadSize;
-                        recvSize += packetSize;
-
-                    }
-                } while (recvSize != payload_total_len);
-
-                if (thisModem().waitResponse(timeout, "+CMQTTRXEND: 0") == 1) {
-                    if (this->callback) {
-                        this->callback((const char *)buffer, buffer + topicSize, recvSize);
-                    }
-                    memset(this->buffer, 0, bufferSize);
+                if (got_end && this->callback && this->buffer) {
+                    this->callback((const char *)this->buffer, this->buffer + topicStored, payloadStored);
+                    memset(this->buffer, 0, this->bufferSize);
                     return true;
                 }
-
+                if (this->buffer && this->bufferSize) memset(this->buffer, 0, this->bufferSize);
             }
         }
         return false;

@@ -8,12 +8,27 @@
 // One-shot SENSOR_CMD from the parameters message. Plain functions so the
 // host test can compile them. The station applies the result in sensor_cmd.cpp.
 //
-// FRAME is the address, the function and the data, with no CRC. ModbusMaster
-// adds the CRC. Function 06 and function 16 (0x10) are the only frames sent.
+// The object is CMD_ID, SENSOR_ID, and FRAME. There is no BAUD field.
+// SENSOR_ID must equal a SENSOR_ID stored in SENSOR_1..SENSOR_8. The RS485
+// port uses that row's BAUD_RATE. FRAME is the address, the function and the
+// data, with no CRC, and is sent as is to the address in its first byte.
+// ModbusMaster adds the CRC. Function 06 and function 16 (0x10) are the only
+// frames sent. No matching SENSOR_ID sends nothing.
 
 static const int SENSOR_CMD_MAX_REGS = 64;
 static const int SENSOR_CMD_BAUD_MIN = 1200;
 static const int SENSOR_CMD_BAUD_MAX = 115200;
+
+// Cellular MQTT stores the topic, a NUL, and the payload in one buffer.
+static const size_t CELLULAR_MQTT_RX_BYTES = 4096;
+
+inline bool cellular_mqtt_rx_fits(const char* topic, const char* payload, size_t buffer_bytes) {
+    if (!topic || !payload || buffer_bytes == 0) return false;
+    size_t topic_len = strlen(topic);
+    size_t payload_len = strlen(payload);
+    if (topic_len >= buffer_bytes) return false;
+    return topic_len + 1 + payload_len <= buffer_bytes;
+}
 
 static const int SENSOR_CMD_MB_SUCCESS = 0x00;
 static const int SENSOR_CMD_MB_ILLEGAL_FUNCTION = 0x01;
@@ -190,16 +205,41 @@ inline bool sensor_cmd_baud_in_range(int baud) {
     return baud >= SENSOR_CMD_BAUD_MIN && baud <= SENSOR_CMD_BAUD_MAX;
 }
 
-// 0 means nothing is sent. A BAUD in the message wins when it is in range.
-// A BAUD outside 1200..115200 is no_baud even if the sensor row has a rate.
-// With no BAUD, the stored rate is used when it is in range.
-inline int sensor_cmd_select_baud(bool has_override, int override_baud, bool has_stored, int stored_baud) {
-    if (has_override) {
-        if (sensor_cmd_baud_in_range(override_baud)) return override_baud;
-        return 0;
+// One stored sensor row. id is the SENSOR_ID in SENSOR_1..SENSOR_8, not a
+// telemetry key. Readings append _0 and _1; those suffixes are not the id.
+struct SensorCmdSlot {
+    const char* id;
+    int baud;
+};
+
+struct SensorCmdChoice {
+    bool send;
+    int baud;
+    const char* err;
+};
+
+// A matching SENSOR_ID selects that row's stored baud. No match does not
+// send and sets unknown_sensor. A match whose BAUD_RATE is outside
+// 1200..115200 does not send and sets no_baud.
+inline void sensor_cmd_choose(const char* sensor_id, const SensorCmdSlot* slots, int count,
+                              SensorCmdChoice* out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->err = "unknown_sensor";
+    if (!sensor_id || !sensor_id[0] || !slots || count <= 0) return;
+    for (int i = 0; i < count; i++) {
+        const char* id = slots[i].id;
+        if (!id || !id[0]) continue;
+        if (strcmp(id, sensor_id) != 0) continue;
+        if (!sensor_cmd_baud_in_range(slots[i].baud)) {
+            out->err = "no_baud";
+            return;
+        }
+        out->send = true;
+        out->baud = slots[i].baud;
+        out->err = NULL;
+        return;
     }
-    if (has_stored && sensor_cmd_baud_in_range(stored_baud)) return stored_baud;
-    return 0;
 }
 
 inline void sensor_cmd_copy_token(char* dst, size_t dst_len, const char* src) {
@@ -261,5 +301,7 @@ inline bool sensor_cmd_take_report(SensorCmdReport* report, SensorCmdAttach* out
 }
 
 uint32_t sensor_cmd_finished_id();
-void sensor_cmd_execute(uint32_t cmd_id, const char* sensor_id, const char* frame, bool has_baud, long baud);
+void sensor_cmd_execute(uint32_t cmd_id, const char* sensor_id, const char* frame);
+// Saves sc_ok 0 and sc_err late. Does not mark CMD_ID finished.
+void sensor_cmd_note_late(uint32_t cmd_id);
 bool sensor_cmd_load_pending(SensorCmdAttach* out);

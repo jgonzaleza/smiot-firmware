@@ -1,5 +1,6 @@
 #include "CellularCommunicationClient.h"
 #include "network_policy.h"
+#include "sensor_cmd.h"
 
 extern TinyGsm modem;
 
@@ -38,6 +39,7 @@ bool CellularCommunicationClient::mqtt_publish(int client_index, const char *top
     return modem.mqtt_publish(client_index, topic, payload);
 }
 bool CellularCommunicationClient::mqtt_subscribe(int client_index, const char *topic) {
+    modem.mqtt_set_rx_buffer_size((uint32_t)CELLULAR_MQTT_RX_BYTES);
     return modem.mqtt_subscribe(client_index, topic);
 }
 void CellularCommunicationClient::mqtt_set_callback(void (*callback)(const char *topic, const uint8_t *payload, uint32_t len)) {

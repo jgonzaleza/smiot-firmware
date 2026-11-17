@@ -298,8 +298,11 @@ static void test_daily_log_and_health() {
     health.net_fail = 2;
     health_ensure_day(&health, 5);
     expect(health.day == 5 && health.net_fail == 2, "first dated day keeps early counters");
+    health.param_rej = 4;
+    health_note_param_reject(&health);
+    expect(health.param_rej == 5, "a rejected parameters JSON is counted");
     health_ensure_day(&health, 6);
-    expect(health.day == 6 && health.net_fail == 0, "a new day clears counters");
+    expect(health.day == 6 && health.net_fail == 0 && health.param_rej == 0, "a new day clears counters");
     expect(!health_due(&health, 6, false), "low or critical power skips the summary");
     expect(health_due(&health, 6, true), "first normal transmit of the day is due");
     health.sent_day = 6;

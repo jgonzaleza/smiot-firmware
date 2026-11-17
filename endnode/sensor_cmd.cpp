@@ -8,26 +8,35 @@
 #include <ModbusMaster.h>
 #include <SD.h>
 
-static bool lookup_stored_baud(const char* sensor_id, int* baud_out) {
-    if (!sensor_id || !sensor_id[0] || !baud_out) return false;
-    for (int i = 0; i < namespaces_size; i++) {
+static const int SENSOR_CMD_SLOTS = 8;
+static const int SENSOR_CMD_ID_BYTES = 40;
+
+static int load_sensor_slots(SensorCmdSlot* slots, char ids[][SENSOR_CMD_ID_BYTES], int cap) {
+    int n = namespaces_size;
+    if (n > cap) n = cap;
+    if (n < 0) n = 0;
+    for (int i = 0; i < n; i++) {
+        ids[i][0] = '\0';
+        slots[i].id = ids[i];
+        slots[i].baud = 0;
         if (!preferences.begin(namespace_id[i].c_str(), true)) continue;
         String stored = preferences.getString("SENSOR_ID", "");
         int baud = preferences.getInt("BAUD_RATE", 0);
-        bool match = stored.length() > 0 && stored == sensor_id;
         preferences.end();
-        if (!match) continue;
-        if (baud == 0) return false;
-        *baud_out = baud;
-        return true;
+        size_t len = stored.length();
+        if (len >= (size_t)SENSOR_CMD_ID_BYTES) len = SENSOR_CMD_ID_BYTES - 1;
+        memcpy(ids[i], stored.c_str(), len);
+        ids[i][len] = '\0';
+        slots[i].baud = baud;
     }
-    return false;
+    return n;
 }
 
-static void save_sensor_cmd(uint32_t cmd_id, const SensorCmdReport* report) {
+// mark_finished stores cmdid. The awake skip passes false so CMD_ID stays open.
+static void save_sensor_cmd(const SensorCmdReport* report, bool mark_finished) {
     if (!report) return;
     if (!preferences.begin("devcfg", false)) return;
-    preferences.putUInt("cmdid", cmd_id);
+    if (mark_finished) preferences.putUInt("cmdid", report->id);
     preferences.putUInt("sc_id", report->id);
     preferences.putUChar("sc_ok", (uint8_t)(report->ok ? 1 : 0));
     preferences.putString("sc_err", report->err);
@@ -114,40 +123,45 @@ bool sensor_cmd_load_pending(SensorCmdAttach* out) {
     return true;
 }
 
-void sensor_cmd_execute(uint32_t cmd_id, const char* sensor_id, const char* frame_text, bool has_baud, long baud_override) {
-    SensorCmdFrame frame;
-    sensor_cmd_parse(frame_text ? frame_text : "", &frame);
+void sensor_cmd_note_late(uint32_t cmd_id) {
+    SensorCmdReport report;
+    sensor_cmd_report_set(&report, cmd_id, false, "late", NULL);
+    save_sensor_cmd(&report, false);
+}
 
-    int stored_baud = 0;
-    bool has_stored = lookup_stored_baud(sensor_id, &stored_baud);
-    int baud = sensor_cmd_select_baud(has_baud, (int)baud_override, has_stored, stored_baud);
+void sensor_cmd_execute(uint32_t cmd_id, const char* sensor_id, const char* frame_text) {
+    char id_buf[SENSOR_CMD_SLOTS][SENSOR_CMD_ID_BYTES];
+    SensorCmdSlot slots[SENSOR_CMD_SLOTS];
+    int count = load_sensor_slots(slots, id_buf, SENSOR_CMD_SLOTS);
+    SensorCmdChoice choice;
+    sensor_cmd_choose(sensor_id, slots, count, &choice);
+
+    SensorCmdFrame frame;
+    memset(&frame, 0, sizeof(frame));
+    if (choice.send) sensor_cmd_parse(frame_text ? frame_text : "", &frame);
 
     const char* err = NULL;
     bool write_ok = false;
-    if (!frame.send) {
+    if (!choice.send) {
+        err = choice.err ? choice.err : "unknown_sensor";
+    } else if (!frame.send) {
         err = frame.err ? frame.err : "bad_frame";
-    } else if (baud == 0) {
-        err = "no_baud";
-    }
-
-    init_peripherals();
-    turn_sensors_on();
-    start_time = millis();
-    wait_for_sensors();
-    feed_watchdog();
-
-    if (frame.send && baud != 0) {
-        uint8_t result = write_sensor_frame(baud, &frame);
+    } else {
+        init_peripherals();
+        turn_sensors_on();
+        start_time = millis();
+        wait_for_sensors();
+        feed_watchdog();
+        uint8_t result = write_sensor_frame(choice.baud, &frame);
         feed_watchdog();
         if (result == SENSOR_CMD_MB_SUCCESS) write_ok = true;
         else err = sensor_cmd_result_error((int)result);
+        turn_sensors_off();
     }
-
-    turn_sensors_off();
 
     SensorCmdReport report;
     sensor_cmd_report_set(&report, cmd_id, write_ok, err, NULL);
-    save_sensor_cmd(cmd_id, &report);
+    save_sensor_cmd(&report, true);
 
     if (sensor_cmd_restarts_on(write_ok)) {
         append_sensor_cmd_line(cmd_id, sensor_id, frame_text);

@@ -1,5 +1,5 @@
 /**
- * Smart IoT End Node Firmware 4.0.9
+ * Smart IoT End Node Firmware 4.0.10
  * Board: Lilygo A7608X-S3
  * Flow: Init -> HTTPS Config/Update -> Read Sensors  -> MQTT Upload -> Store RTC( SD optional) -> Deep Sleep
  * Date: Junio 2026
@@ -47,6 +47,13 @@
  *                    parameter hash so the next message applies it.
  *                    SENSOR_CMD skips this wake after 240s awake and
  *                    does not mark CMD_ID done.
+ * Change Log: 4.0.10 - SENSOR_CMD is CMD_ID, SENSOR_ID, and FRAME.
+ *                    No BAUD field. The port uses the BAUD_RATE stored
+ *                    for that SENSOR_ID in SENSOR_1..SENSOR_8. No match
+ *                    sends nothing and reports unknown_sensor. The awake
+ *                    skip reports sc_err late. Cellular MQTT receive
+ *                    buffer is 4096. A rejected parameters JSON counts
+ *                    as param_rej in the daily health block.
  */
 
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
@@ -658,6 +665,7 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
     DeserializationError json_error = deserializeJson(parameters_payload, payload, len);
     if (json_error) {
         local_logger("MQTT parameter JSON rejected");
+        daily_log_note_param_reject();
         return;
     }
 
@@ -772,14 +780,14 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
     if (restart_requested) store_restart_prev(1);
 
     if (sensor_cmd_late) {
-        // This wake is already past 240s. Leave CMD_ID unfinished.
+        // This wake is already past 240s. Leave CMD_ID unfinished and
+        // report sc_err late on the next message.
         local_logger("SENSOR_CMD skipped, awake more than 240s");
+        sensor_cmd_note_late(sensor_cmd_id);
     } else if (sensor_cmd_runs) {
         JsonVariant cmd = parameters_payload["SENSOR_CMD"];
         const char* sensor_id = "";
         const char* frame = "";
-        bool has_baud = false;
-        long baud = 0;
         if (cmd["SENSOR_ID"].is<const char*>()) {
             const char* id = cmd["SENSOR_ID"].as<const char*>();
             if (id) sensor_id = id;
@@ -788,14 +796,9 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
             const char* text = cmd["FRAME"].as<const char*>();
             if (text) frame = text;
         }
-        JsonVariant baud_value = cmd["BAUD"];
-        if (!baud_value.isNull() && !baud_value.is<bool>() && !baud_value.is<const char*>()
-            && !baud_value.is<JsonObject>() && !baud_value.is<JsonArray>()) {
-            has_baud = true;
-            baud = baud_value.as<long>();
-        }
-        // A successful write restarts and does not return.
-        sensor_cmd_execute(sensor_cmd_id, sensor_id, frame, has_baud, baud);
+        // A successful write restarts and does not return. The address is
+        // the first byte of FRAME. The baud is the stored sensor rate.
+        sensor_cmd_execute(sensor_cmd_id, sensor_id, frame);
     }
 
     parameters_payload.clear();

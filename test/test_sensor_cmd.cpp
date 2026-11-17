@@ -160,13 +160,119 @@ static void test_report_attaches_once() {
     expect(ok_attach.err[0] == '\0' && ok_attach.rsp[0] == '\0', "success leaves sc_err and sc_rsp empty");
 }
 
-static void test_baud_choice() {
-    expect(sensor_cmd_select_baud(false, 0, true, 9600) == 9600, "the stored baud is used");
-    expect(sensor_cmd_select_baud(true, 19200, true, 9600) == 19200, "BAUD overrides the stored rate");
-    expect(sensor_cmd_select_baud(false, 0, false, 0) == 0, "no stored baud and no BAUD is no_baud");
-    expect(sensor_cmd_select_baud(true, 100, true, 9600) == 0, "a BAUD outside 1200..115200 is no_baud");
-    expect(sensor_cmd_select_baud(true, 115200, false, 0) == 115200, "BAUD alone is enough");
-    expect(sensor_cmd_select_baud(false, 0, true, 300) == 0, "a stored rate outside the range is no_baud");
+static bool copy_json_string(const char* json, const char* key, char* out, size_t out_len) {
+    if (!json || !key || !out || out_len == 0) return false;
+    char pattern[40];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char* found = strstr(json, pattern);
+    if (!found) return false;
+    const char* colon = strchr(found + strlen(pattern), ':');
+    if (!colon) return false;
+    const char* quote = strchr(colon, '"');
+    if (!quote) return false;
+    quote++;
+    size_t n = 0;
+    while (quote[n] && quote[n] != '"' && n + 1 < out_len) {
+        out[n] = quote[n];
+        n++;
+    }
+    if (quote[n] != '"') return false;
+    out[n] = '\0';
+    return true;
+}
+
+static const char* k_parameters_topic = "smartiotcr/parameters/v2/224594735082620";
+
+static const char* k_parameters_message =
+    "{\n"
+    "  \"TTS_SEC\": 300,\n"
+    "  \"TTR_SENSOR\": 5000,\n"
+    "  \"R_COUNT\": 1,\n"
+    "  \"C_F_UPDATE\": 86400000,\n"
+    "  \"L_LAT\": 10.01935,\n"
+    "  \"L_LONG\": 84.09909,\n"
+    "  \"G_GPS_DATA\": 0,\n"
+    "  \"RR_SENSOR\": 0,\n"
+    "  \"TB_READINGS\": 2,\n"
+    "  \"R_RATE\": 2,\n"
+    "  \"CAL\": 0,\n"
+    "  \"RESTART\": 0,\n"
+    "  \"SENSOR_CMD\": {\n"
+    "    \"CMD_ID\": 1,\n"
+    "    \"SENSOR_ID\": \"v_s_p\",\n"
+    "    \"FRAME\": \"04 06 00 FD 00 02\"\n"
+    "  }\n"
+    "}\n";
+
+static void test_parameters_message_fits_and_parses() {
+    expect(strcmp(k_parameters_topic, "smartiotcr/parameters/v2/224594735082620") == 0, "the real topic");
+    expect(strstr(k_parameters_message, "BAUD") == NULL, "the message has no BAUD");
+    expect(cellular_mqtt_rx_fits(k_parameters_topic, k_parameters_message, CELLULAR_MQTT_RX_BYTES),
+           "the topic plus the pretty-printed body fits 4096");
+    expect(!cellular_mqtt_rx_fits(k_parameters_topic, k_parameters_message, 256),
+           "the same body does not fit the old 256 buffer");
+
+    char frame_text[64];
+    char sensor_id[40];
+    expect(copy_json_string(k_parameters_message, "FRAME", frame_text, sizeof(frame_text)), "FRAME is present");
+    expect(copy_json_string(k_parameters_message, "SENSOR_ID", sensor_id, sizeof(sensor_id)), "SENSOR_ID is present");
+    expect(strcmp(sensor_id, "v_s_p") == 0, "the bench id is v_s_p");
+    expect(strcmp(frame_text, "04 06 00 FD 00 02") == 0, "FRAME is the bench write");
+
+    SensorCmdFrame frame;
+    sensor_cmd_parse(frame_text, &frame);
+    expect(frame.send, "the bench frame is sent");
+    expect(frame.err == NULL, "the bench frame has no error");
+    expect(frame.addr == 4, "address 4");
+    expect(frame.function == 6, "function 6");
+    expect(frame.reg == 253, "register 253");
+    expect(frame.values[0] == 2, "value 2");
+
+    SensorCmdSlot slots[2];
+    slots[0].id = "rain";
+    slots[0].baud = 4800;
+    slots[1].id = sensor_id;
+    slots[1].baud = 9600;
+    SensorCmdChoice match;
+    sensor_cmd_choose(sensor_id, slots, 2, &match);
+    expect(match.send && match.baud == 9600 && match.err == NULL,
+           "a matching SENSOR_ID selects that sensor's stored baud");
+
+    SensorCmdChoice suffix;
+    sensor_cmd_choose("v_s_p_0", slots, 2, &suffix);
+    expect(!suffix.send && suffix.err && strcmp(suffix.err, "unknown_sensor") == 0,
+           "a telemetry suffix is not the stored id");
+
+    SensorCmdChoice missing;
+    sensor_cmd_choose("not-a-sensor", slots, 2, &missing);
+    expect(!missing.send && missing.baud == 0, "a SENSOR_ID that matches nothing sends nothing");
+    expect(missing.err && strcmp(missing.err, "unknown_sensor") == 0,
+           "a SENSOR_ID that matches nothing reports unknown_sensor");
+}
+
+static void test_stored_baud_only() {
+    SensorCmdSlot slots[1];
+    slots[0].id = "v_s_p";
+    slots[0].baud = 19200;
+    SensorCmdChoice choice;
+    sensor_cmd_choose("v_s_p", slots, 1, &choice);
+    expect(choice.send && choice.baud == 19200, "the stored baud is the port speed");
+
+    slots[0].baud = 300;
+    sensor_cmd_choose("v_s_p", slots, 1, &choice);
+    expect(!choice.send && choice.err && strcmp(choice.err, "no_baud") == 0,
+           "a stored rate outside 1200..115200 sends nothing");
+
+    sensor_cmd_choose("", slots, 1, &choice);
+    expect(!choice.send && strcmp(choice.err, "unknown_sensor") == 0, "an empty id matches nothing");
+}
+
+static void test_awake_skip_reports_late() {
+    SensorCmdReport report;
+    sensor_cmd_report_set(&report, 1, false, "late", NULL);
+    expect(report.pending && report.ok == 0, "awake skip is sc_ok 0");
+    expect(strcmp(report.err, "late") == 0, "awake skip reports sc_err late");
+    expect(report.id == 1, "awake skip keeps the command id");
 }
 
 static void test_sd_line() {
@@ -186,7 +292,9 @@ int main() {
     test_restart_rising_edge();
     test_sensor_cmd_awake_guard();
     test_report_attaches_once();
-    test_baud_choice();
+    test_parameters_message_fits_and_parses();
+    test_stored_baud_only();
+    test_awake_skip_reports_late();
     test_sd_line();
     if (failures) {
         printf("%d failed\n", failures);
