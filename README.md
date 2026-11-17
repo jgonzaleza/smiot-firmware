@@ -46,6 +46,14 @@ The Amazon root CA and the firmware signing **public** key are in the repository
 
 `DEVICE_TYPE` is not a build flag. The device reads it from the backend config (2 = weather station, 3 = end node) and stores it in Preferences. The compiled default is 2.
 
+## Parameters
+
+The station subscribes to `smartiotcr/parameters/v2/<efuse mac>`. The broker retains the message. A body whose hash matches the last applied message is skipped, unless `RR_SENSOR` rises, `RESTART` rises from 0 to 1, or `SENSOR_CMD` has a new `CMD_ID`.
+
+`RESTART` has no id. The last value is the Preferences namespace `devcfg`, key `rsprev`. A change from 0 to 1 restarts inside the parameters callback, after the rain pulse and `SENSOR_CMD`, during the 5 s MQTT wait. The station stores `rsprev` 1 before it restarts, so a retained 1 does not loop. The next message sends 0, which arms it again. A missing `RESTART` leaves `rsprev` unchanged. The saved latitude and longitude stay. The parameter hash is cleared, so the next message is applied in full, including `L_LAT` and `L_LONG`.
+
+`SENSOR_CMD` is optional. It is the only object that carries an id (`CMD_ID`). Each non-zero id runs once. If the station has been awake for more than 240 s when the command arrives, that command waits for a later wake and the id is not marked done.
+
 An OTA image whose variant does not match the running build is rejected. A version that is not newer is rejected.
 
 ## OTA

@@ -135,12 +135,34 @@ inline bool sensor_cmd_should_run(bool id_present, uint32_t cmd_id, uint32_t fin
     return true;
 }
 
-// Retained parameters are skipped when the body, the restart id and the rain
+// Retained parameters are skipped when the body, the restart edge and the rain
 // edge are unchanged. An unfinished command still runs when the hash matches.
 inline bool sensor_cmd_parameters_unchanged(bool hash_matches, bool restart_requested,
                                             bool pulse_rain, bool cmd_should_run) {
     if (cmd_should_run) return false;
     return hash_matches && !restart_requested && !pulse_rain;
+}
+
+// RESTART is a 0-to-1 edge. last is the stored rsprev value.
+// present is false when the key is missing or null: next stays last, and
+// this does not restart. A present value is the one to store. Only a stored
+// 0 followed by 1 restarts.
+inline bool restart_rising_edge(uint32_t last, bool present, uint32_t value, uint32_t* next) {
+    if (!next) return false;
+    if (!present) {
+        *next = last;
+        return false;
+    }
+    *next = value;
+    return last == 0 && value == 1;
+}
+
+// More than 240s awake, the same span as AWAKE_BUDGET_MS. The command waits
+// for a later wake, and CMD_ID stays unfinished.
+static const uint32_t SENSOR_CMD_AWAKE_SKIP_MS = 240000UL;
+
+inline bool sensor_cmd_skip_this_wake(uint32_t awake_ms) {
+    return awake_ms > SENSOR_CMD_AWAKE_SKIP_MS;
 }
 
 inline bool sensor_cmd_restarts_on(bool write_ok) {
