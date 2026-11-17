@@ -52,7 +52,9 @@ The station subscribes to `smartiotcr/parameters/v2/<efuse mac>`. The broker ret
 
 `RESTART` has no id. The last value is the Preferences namespace `devcfg`, key `rsprev`. A change from 0 to 1 restarts inside the parameters callback, after the rain pulse and `SENSOR_CMD`, during the 5 s MQTT wait. The station stores `rsprev` 1 before it restarts, so a retained 1 does not loop. The next message sends 0, which arms it again. A missing `RESTART` leaves `rsprev` unchanged. The saved latitude and longitude stay. The parameter hash is cleared, so the next message is applied in full, including `L_LAT` and `L_LONG`.
 
-`SENSOR_CMD` is optional. It is the only object that carries an id (`CMD_ID`). Each non-zero id runs once. If the station has been awake for more than 240 s when the command arrives, that command waits for a later wake and the id is not marked done.
+`SENSOR_CMD` is optional. It is the only object that carries an id (`CMD_ID`). The object is `CMD_ID`, `SENSOR_ID`, and `FRAME`. There is no `BAUD`. Each non-zero id runs once. `SENSOR_ID` must equal a `SENSOR_ID` stored in `SENSOR_1` through `SENSOR_8` on first start. The bench id is `v_s_p`. Telemetry keys add `_0` and `_1` for each reading; those suffixes are not the id. The RS485 port uses that sensor's stored `BAUD_RATE`. `FRAME` is sent as is, to the address in its first byte. If no stored id matches, nothing is sent and the next message reports `sc_ok` 0 and `sc_err` `unknown_sensor`. If the station has been awake for more than 240 s when the command arrives, that command waits for a later wake, the id is not marked done, and the next message reports `sc_err` `late`.
+
+The cellular MQTT receive buffer is 4096 bytes, set with `mqtt_set_rx_buffer_size` before subscribe. The topic and the payload share that buffer. A message that does not fit is dropped and is not parsed. A parameters body that is not valid JSON is counted as `param_rej` in the daily health block.
 
 An OTA image whose variant does not match the running build is rejected. A version that is not newer is rejected.
 

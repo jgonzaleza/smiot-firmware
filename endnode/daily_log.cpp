@@ -9,7 +9,11 @@
 #include <stdio.h>
 
 RTC_DATA_ATTR DailyHealth g_daily_health = {
-    -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1
+    -1, -1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,
+    0,
+    -1, -1
 };
 
 RTC_DATA_ATTR int smiot_log_level = LOG_INFO;
@@ -84,6 +88,11 @@ void daily_log_note_gps_fail() {
 void daily_log_note_sd_error() {
     health_touch_today();
     if (g_daily_health.sd_err < 65535) g_daily_health.sd_err++;
+}
+
+void daily_log_note_param_reject() {
+    health_touch_today();
+    health_note_param_reject(&g_daily_health);
 }
 
 void daily_log_note_voltage(float volts) {
@@ -189,6 +198,7 @@ void attach_daily_health(JsonDocument& doc) {
     health["nf"] = g_daily_health.net_fail;
     health["gf"] = g_daily_health.gps_fail;
     health["sd_err"] = g_daily_health.sd_err;
+    health["param_rej"] = g_daily_health.param_rej;
     health["q"] = rtc_queue_records() + sd_queue_records();
     append_centi(health, "vmin", g_daily_health.vmin_centi);
     append_centi(health, "vmax", g_daily_health.vmax_centi);

@@ -31,10 +31,16 @@ struct DailyHealth {
     uint16_t net_fail;
     uint16_t gps_fail;
     uint16_t sd_err;
+    uint16_t param_rej; // rejected parameters JSON. Uses the pad before awake_sec.
     uint32_t awake_sec;
     int16_t vmin_centi; // -1 when no pack voltage has been seen
     int16_t vmax_centi;
 };
+
+static_assert(sizeof(DailyHealth) == 36, "DailyHealth size stays 36");
+static_assert(offsetof(DailyHealth, sd_err) == 24, "sd_err offset");
+static_assert(offsetof(DailyHealth, param_rej) == 26, "param_rej uses the old pad");
+static_assert(offsetof(DailyHealth, awake_sec) == 28, "awake_sec offset");
 
 // One wake's modem steps. -1 means that step did not run.
 // reason is a short token with no comma: at_fail, sim_timeout, skip, cmqtt_34, ...
@@ -233,6 +239,11 @@ inline void health_add_awake(DailyHealth* health, uint32_t sec) {
     health->awake_sec = sum;
 }
 
+inline void health_note_param_reject(DailyHealth* health) {
+    if (!health) return;
+    if (health->param_rej < 65535) health->param_rej++;
+}
+
 inline char log_level_letter(int level) {
     if (level <= LOG_ERROR) return 'E';
     if (level == LOG_WARN) return 'W';
@@ -286,6 +297,7 @@ void daily_log_boot(int reset_reason);
 void daily_log_note_net_fail();
 void daily_log_note_gps_fail();
 void daily_log_note_sd_error();
+void daily_log_note_param_reject();
 void daily_log_note_voltage(float volts);
 void daily_log_set_level_text(const char* text);
 void daily_log_set_level_code(int level);
