@@ -111,6 +111,32 @@ static void test_restart_decision() {
     expect(!sensor_cmd_restarts_on(false), "failure does not request a restart");
 }
 
+static void test_restart_rising_edge() {
+    uint32_t next = 99;
+    expect(restart_rising_edge(0, true, 1, &next), "0 then 1 restarts");
+    expect(next == 1, "0 then 1 stores 1");
+
+    expect(!restart_rising_edge(1, true, 1, &next), "1 then 1 does not restart");
+    expect(next == 1, "1 then 1 keeps 1");
+
+    expect(!restart_rising_edge(1, true, 0, &next), "1 then 0 does not restart");
+    expect(next == 0, "1 then 0 stores 0");
+    expect(restart_rising_edge(next, true, 1, &next), "1 then 0 then 1 restarts again");
+    expect(next == 1, "1 then 0 then 1 stores 1");
+
+    next = 0;
+    expect(!restart_rising_edge(1, false, 1, &next), "a null RESTART does not restart");
+    expect(next == 1, "a null RESTART keeps the last value");
+    expect(!restart_rising_edge(0, false, 0, &next), "a null RESTART does not restart from 0");
+    expect(next == 0, "a null RESTART keeps 0");
+}
+
+static void test_sensor_cmd_awake_guard() {
+    expect(!sensor_cmd_skip_this_wake(0), "a fresh wake runs SENSOR_CMD");
+    expect(!sensor_cmd_skip_this_wake(SENSOR_CMD_AWAKE_SKIP_MS), "240s still runs SENSOR_CMD");
+    expect(sensor_cmd_skip_this_wake(SENSOR_CMD_AWAKE_SKIP_MS + 1), "more than 240s skips SENSOR_CMD");
+}
+
 static void test_report_attaches_once() {
     SensorCmdReport report;
     sensor_cmd_report_set(&report, 17, false, "no_response", "01 86 02");
@@ -157,6 +183,8 @@ int main() {
     test_modbus_result_names();
     test_run_once_and_hash();
     test_restart_decision();
+    test_restart_rising_edge();
+    test_sensor_cmd_awake_guard();
     test_report_attaches_once();
     test_baud_choice();
     test_sd_line();

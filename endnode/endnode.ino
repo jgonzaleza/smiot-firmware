@@ -1,5 +1,5 @@
 /**
- * Smart IoT End Node Firmware 4.0.8
+ * Smart IoT End Node Firmware 4.0.9
  * Board: Lilygo A7608X-S3
  * Flow: Init -> HTTPS Config/Update -> Read Sensors  -> MQTT Upload -> Store RTC( SD optional) -> Deep Sleep
  * Date: Junio 2026
@@ -41,6 +41,12 @@
  * Change Log: 4.0.8 - Optional SENSOR_CMD in the parameters message.
  *                    Function 06 and 16 go out through ModbusMaster.
  *                    A successful command restarts as a first start.
+ * Change Log: 4.0.9 - RESTART is a 0-to-1 edge. No RESTART_ID.
+ *                    The last value is Preferences devcfg/rsprev.
+ *                    A restart keeps the location and clears the
+ *                    parameter hash so the next message applies it.
+ *                    SENSOR_CMD skips this wake after 240s awake and
+ *                    does not mark CMD_ID done.
  */
 
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
@@ -462,14 +468,14 @@ void perform_restart() {
     // RtcPersist survives ESP.restart(), so a software restart is not a first
     // start unless we mark it. The unsent queue stays: spillover moved the
     // RTC pool to the SD card when it could, and this does not wipe the pool.
-    // The saved fix is also in Preferences, and the next boot reloads it.
+    // The saved location stays in RTC and in Preferences. The parameter hash
+    // is cleared so the next parameters message is applied in full, including
+    // L_LAT and L_LONG. GPS still runs on this first start.
     first_run = 1;
-    local_lat2 = 0.0f;
-    local_lon2 = 0.0f;
     gps_fail_streak = 0;
+    g_rtc.param_hash = 0;
     if (preferences.begin("devcfg", false)) {
-        preferences.putFloat("lat", 0.0f);
-        preferences.putFloat("lon", 0.0f);
+        preferences.putUInt("phash", 0);
         preferences.end();
     }
     rtc_persist_commit();
@@ -523,7 +529,6 @@ void clamp_runtime_params() {
 void save_device_params() {
     preferences.begin("devcfg", false);
     preferences.putUInt("phash", g_rtc.param_hash);
-    preferences.putUInt("rsid", g_rtc.last_restart_id);
     preferences.putUInt("tts", TIME_TO_SLEEP_SEC);
     preferences.putUInt("ttr", TIME_TO_READ_SENSOR);
     preferences.putUInt("rcount", READING_COUNT);
@@ -562,7 +567,6 @@ void load_device_params() {
     local_lat2 = preferences.getFloat("lat", local_lat2);
     local_lon2 = preferences.getFloat("lon", local_lon2);
     g_rtc.param_hash = preferences.getUInt("phash", 0);
-    g_rtc.last_restart_id = preferences.getUInt("rsid", 0);
     active_device_type = preferences.getInt("dtype", active_device_type);
     timezone_offset_sec = preferences.getInt("tz", (int)timezone_offset_sec);
     String country = preferences.getString("ctry", "CR");
@@ -608,6 +612,36 @@ static bool command_flag_on(JsonVariant value) {
     return flag_is_on(true, is_bool, bool_value, is_number, number);
 }
 
+// Missing or null stays absent. JSON true is 1 and JSON false is 0.
+// A number is stored as that uint. Strings, objects, and arrays are absent.
+static bool restart_value_from_json(JsonVariant value, uint32_t* out) {
+    if (!out || value.isNull()) return false;
+    if (value.is<bool>()) {
+        *out = value.as<bool>() ? 1u : 0u;
+        return true;
+    }
+    if (value.is<const char*>() || value.is<JsonObject>() || value.is<JsonArray>()) return false;
+    long raw = value.as<long>();
+    if (raw < 0) return false;
+    *out = (uint32_t)raw;
+    return true;
+}
+
+static uint32_t load_restart_prev() {
+    if (!preferences.begin("devcfg", true)) return 0;
+    uint32_t value = preferences.getUInt("rsprev", 0);
+    preferences.end();
+    return value;
+}
+
+// Written before perform_restart() so a retained 1 cannot restart again.
+static bool store_restart_prev(uint32_t value) {
+    if (!preferences.begin("devcfg", false)) return false;
+    size_t wrote = preferences.putUInt("rsprev", value);
+    preferences.end();
+    return wrote == sizeof(uint32_t);
+}
+
 // MQTT Callback to receive parameters
 void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len) {
 
@@ -628,28 +662,29 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
     }
 
     uint32_t hash = payload_hash32(payload, len);
-    bool restart_requested = false;
-    uint32_t restart_id = 0;
-    if (command_flag_on(parameters_payload["RESTART"])) {
-        if (!parameters_payload["RESTART_ID"].isNull()) {
-            restart_id = parameters_payload["RESTART_ID"].as<uint32_t>();
-        }
-        if (restart_id == 0) restart_id = hash;
-        if (restart_id != g_rtc.last_restart_id) restart_requested = true;
-    }
+    uint32_t restart_last = load_restart_prev();
+    uint32_t restart_value = 0;
+    const bool restart_present = restart_value_from_json(parameters_payload["RESTART"], &restart_value);
+    uint32_t restart_next = restart_last;
+    const bool restart_requested = restart_rising_edge(restart_last, restart_present, restart_value, &restart_next);
 
     JsonVariant rr_value = parameters_payload["RR_SENSOR"];
     const bool rr_on = command_flag_on(rr_value);
     const bool pulse_rain = rain_pulse_due(rr_on, g_rtc.rr_prev != 0);
 
+    uint32_t awake_ms = 0;
+    if (g_wake_start_ms != 0 && millis() >= g_wake_start_ms) {
+        awake_ms = (uint32_t)(millis() - g_wake_start_ms);
+    }
     uint32_t sensor_cmd_id = 0;
     const bool sensor_cmd_present = sensor_cmd_id_from_payload(parameters_payload["SENSOR_CMD"], &sensor_cmd_id);
     const bool sensor_cmd_runs = sensor_cmd_should_run(sensor_cmd_present, sensor_cmd_id, sensor_cmd_finished_id());
+    const bool sensor_cmd_late = sensor_cmd_runs && sensor_cmd_skip_this_wake(awake_ms);
 
     // Retained messages are delivered again on the next connect.
-    // Skip them when the body and the restart id are unchanged and the rain
-    // command is not a rising edge. A new SENSOR_CMD id still runs when the
-    // rest of the body was already applied. A repeated 1 stays quiet; 0 then 1 pulses.
+    // Skip them when the body is unchanged, RESTART is not a 0-to-1 edge, and
+    // the rain command is not a rising edge. A new SENSOR_CMD id still runs
+    // when the rest of the body was already applied. A repeated 1 stays quiet.
     if (sensor_cmd_parameters_unchanged(hash == g_rtc.param_hash, restart_requested, pulse_rain, sensor_cmd_runs)) {
         parameters_payload.clear();
         return;
@@ -721,7 +756,6 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
 
     if (hash != g_rtc.param_hash || restart_requested || rr_changed) {
         g_rtc.param_hash = hash;
-        if (restart_requested) g_rtc.last_restart_id = restart_id;
         save_device_params();
         rtc_persist_commit();
     }
@@ -733,7 +767,14 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
         reset_sensor();
     }
 
-    if (sensor_cmd_runs) {
+    // A successful SENSOR_CMD calls perform_restart() and does not return.
+    // Store the edge first so that path cannot leave a retained 1 armed.
+    if (restart_requested) store_restart_prev(1);
+
+    if (sensor_cmd_late) {
+        // This wake is already past 240s. Leave CMD_ID unfinished.
+        local_logger("SENSOR_CMD skipped, awake more than 240s");
+    } else if (sensor_cmd_runs) {
         JsonVariant cmd = parameters_payload["SENSOR_CMD"];
         const char* sensor_id = "";
         const char* frame = "";
@@ -759,10 +800,16 @@ void get_mqtt_parameters(const char *topic, const uint8_t *payload, uint32_t len
 
     parameters_payload.clear();
 
+    // Same moment as v3.0.0: after the rain pulse and SENSOR_CMD, inside this
+    // callback, during the 5 s comm.mqtt_handle(5000) window. rsprev is stored
+    // before the restart so a retained 1 cannot loop. A 0 re-arms it.
     if (restart_requested) {
+        store_restart_prev(1);
         local_logger("Remote restart command received");
         delay(500);
         perform_restart();
+    } else if (restart_present && restart_next != restart_last) {
+        store_restart_prev(restart_next);
     }
 }
 

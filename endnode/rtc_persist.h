@@ -25,7 +25,7 @@ struct RtcPersist {
     int32_t reading_cnt;
     int32_t last_reset_day;
     uint32_t param_hash;
-    uint32_t last_restart_id;
+    uint32_t last_restart_id; // unused since 4.0.9. Kept so the SIF1 layout stays valid.
     int32_t pool_length;
     uint8_t is_first_run;
     uint8_t err_count;
